@@ -1,7 +1,14 @@
 # FreightIQ — Dry Bulk Freight Intelligence Platform
 
-A professional-grade market intelligence platform for dry bulk freight, built with Plotly Dash.
-Designed for commodity traders and analysts at firms trading iron ore, coal, grain, and minor bulks.
+A production-grade market intelligence workspace for dry bulk freight markets, built with Plotly Dash.
+Designed for commodity traders and analysts trading iron ore, coal, grain, and minor bulks.
+
+**Highlights**
+- 🛰️ **Live AIS vessel tracking** (aisstream.io WebSocket) — fleet utilisation, slow-steaming detection, chokepoint traffic, Baltic-route assignment
+- 🔮 **5TC Capes FFA forward curve** derived from BDRY options via put-call parity, with implied BDI calibration anchored on real cycle peaks/troughs
+- 📧 **Automated daily morning briefing email** sent at 07:30 Europe/Zurich via GitHub Actions cron — overnight context, key levels, supply/demand drivers, news with relevance scoring
+- ⚖️ **TCE calculator** with full voyage economics, sensitivity analysis, breakeven freight rate solver
+- 🌍 **Geopolitical chokepoint monitor** (Suez · Hormuz · Red Sea · Panama · Malacca · Black Sea) with live vessel counts and dry-bulk transit shares
 
 ---
 
@@ -11,11 +18,11 @@ Designed for commodity traders and analysts at firms trading iron ore, coal, gra
 |---|---|
 | 🏠 Overview | Composite index · regime gauge · cross-asset snapshot · news |
 | 📊 Market Dashboard | Freight proxy performance · moving averages · seasonality · regime |
-| 🚢 Freight Analysis | BDI proxy deep dive · sub-index overlay · vol · z-score · cycle phase |
+| 🚢 Freight Analysis | BDI proxy deep dive · BDRY 5TC FFA proxy · vol · z-score · cycle phase |
+| 🔮 FFA & Forward | BDRY-options forward curve (put-call parity) · implied BDI levels · historical cycle reference |
 | ⚖️ Supply & Demand | Fleet & orderbook · **live AIS vessel tracking** · chokepoints · sanctions |
 | 🌍 Geopolitical Intel | Chokepoint monitor · rerouting impact · IMO timeline · disruption events |
 | 📈 Macro Overlay | FRED data · yield curve · USD index · industrial production · bunker cost |
-| 📉 FFA & Derivatives | Manual forward curve builder · BDRY vol proxy · seasonal basis |
 | 🔗 Cross-Commodity | Rolling correlation matrix · lead-lag analysis · scatter regression |
 | 🧮 TCE Calculator | Full voyage economics · sensitivity tornado · scenario comparison · CSV export |
 | 📰 Intelligence Feed | RSS aggregation · relevance scoring · signal detection · weekly briefing |
@@ -187,10 +194,21 @@ Rates Collapse → Scrapping → Recovery
 ## Known Limitations
 
 - Baltic Exchange real-time data requires a paid subscription — all BDI/BCI/BPI/BSI/BHSI values are proxies
-- FFA live quotes require a Baltic Exchange or broker platform — forward curves are manually entered
+- FFA live quotes require a Baltic Exchange or broker platform — the BDRY-options-derived forward curve in this app is indicative only, not a substitute for institutional FFA screens
 - Fleet and orderbook data are 2024 estimates — live data requires Clarksons Research or VesselsValue
 - Some RSS feeds (Bloomberg, Reuters) may require authentication
 
 ---
 
-*FreightIQ — built for commodity traders, not investment advice.*
+## Author
+
+Built by **Virgile Roumens** — Financial Engineer (ESILV) · based in Geneva · working in dry bulk freight markets.
+
+[![GitHub](https://img.shields.io/badge/GitHub-Virgile--Roumens-181717?style=flat-square&logo=github)](https://github.com/Virgile-Roumens)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-Connect-0077B5?style=flat-square&logo=linkedin&logoColor=white)](https://linkedin.com/in/virgile-roumens)
+
+This project is a personal portfolio piece. Contributions, suggestions, and discussion welcome via Issues.
+
+---
+
+*FreightIQ — built for commodity traders, not investment advice. All freight indices shown are public-API proxies; institutional Baltic Exchange data requires subscription.*
