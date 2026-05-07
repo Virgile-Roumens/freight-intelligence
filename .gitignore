@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project — caches and generated artefacts
+data_cache/
+logs/
+exports/
+scripts/briefing_preview.html
+
+# Secrets — NEVER commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Build / dist
+build/
+dist/
+*.egg
+
+# Claude Code local overrides
+.claude/settings.local.json
