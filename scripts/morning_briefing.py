@@ -201,6 +201,137 @@ def _section_header(label: str, emoji: str = "") -> str:
             f'text-transform:uppercase; font-weight:600; margin-bottom:10px;">{e}{label}</div>')
 
 
+def build_overnight_context(data: dict) -> str:
+    """
+    Narrative prose paragraph describing the overnight dry bulk market state.
+    Adapts daily based on BDRY direction, cycle phase, cross-asset moves,
+    FFA forward curve shape, and top news driver. ~3-5 sentences.
+    """
+    snap     = data["snapshot"]
+    macro    = data["macro"]
+    regime   = data["regime"]
+    sigs     = data["signals"]
+    articles = data["articles"]
+    spot     = data["bdry_spot"]
+    fwd      = data["bdry_fwd"]
+
+    sentences: list[str] = []
+
+    # ── Lead: BDRY direction + cycle phase ───────────────────────────────────
+    bdry     = snap.get("BDRY", {})
+    bdry_d1d = bdry.get("delta_1d", 0) or 0
+    bdry_d5d = bdry.get("delta_5d", 0) or 0
+
+    if spot:
+        if   bdry_d1d >  0.015: action = "extended sharply higher overnight"
+        elif bdry_d1d >  0.005: action = "edged higher overnight"
+        elif bdry_d1d < -0.015: action = "sold off overnight"
+        elif bdry_d1d < -0.005: action = "drifted lower overnight"
+        else:                   action = "traded sideways overnight"
+
+        cycle_phrase = {
+            "EXPANSION":   " with the cycle still in expansion territory",
+            "PEAK":        " though the cycle is showing late-stage peak signals",
+            "CONTRACTION": " amid an active cycle contraction",
+            "TROUGH":      " near cycle-trough levels",
+            "NEUTRAL":     "",
+        }.get(regime.get("phase", ""), "")
+
+        five_day = ""
+        if   bdry_d5d >  0.05: five_day = f" (+{bdry_d5d*100:.1f}% over 5 sessions — momentum building)"
+        elif bdry_d5d < -0.05: five_day = f" ({bdry_d5d*100:+.1f}% over 5 sessions — sustained pressure)"
+        elif abs(bdry_d5d) >= 0.02: five_day = f" ({bdry_d5d*100:+.1f}% on the week)"
+
+        sentences.append(
+            f"Dry bulk paper {action} — BDRY ETF (closest free 5TC Capes FFA proxy) "
+            f"settled at <b>${spot:.2f}</b>{five_day}, implying a BDI level around "
+            f"<b>{int(spot * _BDI_FACTOR_MID):,}</b>{cycle_phrase}."
+        )
+
+    # ── Cross-asset context (only mention what actually moved) ───────────────
+    cross_bits = []
+
+    brent = macro.get("Brent")
+    if brent and abs(brent["d1d"]) > 0.3:
+        direction = "firmer" if brent["d1d"] > 0 else "softer"
+        cross_bits.append(
+            f"Brent {direction} at <b>${brent['value']:.2f}/bbl</b> ({brent['d1d']:+.2f}%, "
+            f"VLSFO bunker proxy ~${brent['value']*6.5:.0f}/mt)"
+        )
+
+    dxy = macro.get("DXY")
+    if dxy and abs(dxy["d1d"]) > 0.25:
+        direction  = "firming"  if dxy["d1d"] > 0 else "softening"
+        impact     = "headwind" if dxy["d1d"] > 0 else "tailwind"
+        cross_bits.append(
+            f"DXY {direction} ({dxy['d1d']:+.2f}%) — typically a {impact} for commodity flows"
+        )
+
+    vale = macro.get("VALE")
+    if vale and abs(vale["d1d"]) > 1.0:
+        direction = "rallied" if vale["d1d"] > 0 else "sold off"
+        cross_bits.append(
+            f"iron ore proxy (VALE) {direction} {vale['d1d']:+.2f}% — Capesize demand bellwether"
+        )
+
+    grain_moves = []
+    for key, lbl in [("Corn", "corn"), ("Wheat", "wheat"), ("Soybean", "soybeans")]:
+        m = macro.get(key)
+        if m and abs(m["d1d"]) > 1.0:
+            grain_moves.append(f"{lbl} {m['d1d']:+.2f}%")
+    if grain_moves:
+        cross_bits.append(
+            f"on the ag side {', '.join(grain_moves)} — relevant to LDC's Panamax/Supramax exposure"
+        )
+
+    if cross_bits:
+        sentences.append("Cross-asset: " + "; ".join(cross_bits) + ".")
+
+    # ── FFA forward curve shape ──────────────────────────────────────────────
+    if spot and fwd:
+        nearest = fwd[0]
+        chg = (nearest["fwd"] / spot - 1) * 100
+        if abs(chg) > 2:
+            if chg < 0:
+                shape = "contango (forward at discount)"
+                read  = "paper pricing softer prompt physical or seasonal weakness"
+            else:
+                shape = "backwardation (forward at premium)"
+                read  = "paper signalling tight prompt supply"
+            sentences.append(
+                f"FFA forward curve sits in <b>{shape}</b> "
+                f"({datetime.strptime(nearest['expiry'], '%Y-%m-%d').strftime('%b %Y')} "
+                f"${nearest['fwd']:.2f}, {chg:+.1f}% vs spot) — {read}."
+            )
+
+    # ── Top hook: signal or highest-relevance article ────────────────────────
+    hook = ""
+    if sigs:
+        s_text = (sigs[0].get("text", "") or "").strip()
+        if s_text:
+            hook = s_text[:170]
+    if not hook and articles:
+        top = sorted(articles, key=lambda a: -a.get("score", 0))[0]
+        if top.get("score", 0) > 0.5:
+            hook = (top.get("title", "") or "")[:160]
+    if hook:
+        sentences.append(f"<b>Watch today:</b> {hook}.")
+
+    if not sentences:
+        sentences = [
+            "Limited overnight data — markets may be closed or feeds intermittent. "
+            "Refer to the sections below for available figures."
+        ]
+
+    paragraph = " ".join(sentences)
+    return f"""
+    {_section_header("Overnight Dry Bulk Context", "🌅")}
+    <div style="font-size:14px; line-height:1.7; color:#1a202c; padding:16px 20px; background:#f7f9fc; border-left:4px solid #5b8cbf; border-radius:0 4px 4px 0;">
+      {paragraph}
+    </div>
+    """
+
+
 def build_exec_summary(data: dict) -> str:
     snap   = data["snapshot"]
     macro  = data["macro"]
@@ -751,8 +882,9 @@ def build_email(data: dict) -> tuple[str, str]:
           </div>
         </td></tr>
 
-        <tr><td style="padding:24px 32px; background:#fafbfc;">{build_exec_summary(data)}</td></tr>
-        <tr><td style="padding:24px 32px;">{build_levels_table(data)}</td></tr>
+        <tr><td style="padding:24px 32px;">{build_overnight_context(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px; background:#fafbfc;">{build_exec_summary(data)}</td></tr>
+        <tr><td style="padding:24px 32px; background:#ffffff;">{build_levels_table(data)}</td></tr>
         <tr><td style="padding:0 32px 24px;">{build_ffa_curve(data)}</td></tr>
         <tr><td style="padding:0 32px 24px;">{build_supply_section(data)}</td></tr>
         <tr><td style="padding:0 32px 24px;">{build_demand_section(data)}</td></tr>
