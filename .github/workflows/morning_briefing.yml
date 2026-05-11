@@ -2,26 +2,29 @@ name: Morning Briefing — Dry Bulk
 
 # Runs in GitHub's cloud — independent of your laptop being on or off.
 #
-# Cron schedule (GitHub Actions cron is in UTC):
-#   - Summer (CEST = UTC+2): 05:30 UTC = 07:30 local  → months 3-10
-#   - Winter (CET  = UTC+1): 06:30 UTC = 07:30 local  → months 11,12,1,2
+# IMPORTANT note on timing:
+#   GitHub Actions cron has NO SLA. Common minute marks (:00, :30) are heavily
+#   congested and can be delayed by 1-3+ hours. We schedule on `:07` past the
+#   hour (uncommon) and start 1+ hour BEFORE 07:30 to absorb typical delays.
 #
-# Two cron lines so the email lands at 07:30 Geneva time year-round.
-# DST transition days (last Sun of Mar/Oct) may be off by 1 hour — acceptable.
+#   Summer (CEST = UTC+2): 04:07 UTC → typically delivers 04:30-06:30 UTC = 06:30-08:30 CEST
+#   Winter (CET  = UTC+1): 05:07 UTC → typically delivers 05:30-07:30 UTC = 06:30-08:30 CET
 #
 # Required repository secrets (Settings → Secrets and variables → Actions):
-#   GMAIL_USER          — your Gmail address (e.g., virgile.roumens@gmail.com)
-#   GMAIL_APP_PASSWORD  — 16-char Google App Password (NOT your normal password)
-#                         Create at: https://myaccount.google.com/apppasswords
-#                         (requires 2-Step Verification enabled)
-#   AIS_API_KEY         — aisstream.io key (optional but recommended)
+#   GMAIL_USER          — Gmail address
+#   GMAIL_APP_PASSWORD  — 16-char Google App Password
+#   AIS_API_KEY         — aisstream.io key (optional)
 #   FRED_API_KEY        — FRED API key (optional)
 
 on:
   schedule:
-    - cron: '30 5 * 3-10 *'        # Summer (CEST) — 07:30 local
-    - cron: '30 6 * 1,2,11,12 *'   # Winter (CET)  — 07:30 local
-  workflow_dispatch:                # Manual trigger from GitHub UI for testing
+    - cron: '7 4 * 3-10 *'         # Summer (CEST) — fires at 04:07 UTC = 06:07 CEST
+    - cron: '7 5 * 1,2,11,12 *'    # Winter (CET)  — fires at 05:07 UTC = 06:07 CET
+  workflow_dispatch:                # Manual trigger from GitHub UI
+
+# Allow the workflow to commit BDI history back to the repo
+permissions:
+  contents: write
 
 jobs:
   send-briefing:
@@ -51,3 +54,18 @@ jobs:
           AIS_API_KEY:        ${{ secrets.AIS_API_KEY }}
           FRED_API_KEY:       ${{ secrets.FRED_API_KEY }}
         run: python scripts/morning_briefing.py
+
+      # Persist today's BDI value back to the repo so history accumulates
+      # across runs. If nothing changed, the commit is a no-op.
+      - name: Commit BDI history
+        if: success()
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "FreightIQ Bot"
+          git add data/bdi_history.json || true
+          if git diff --cached --quiet; then
+            echo "No BDI history changes to commit."
+          else
+            git commit -m "Update BDI history $(date -u +%Y-%m-%d)"
+            git push
+          fi

@@ -10,12 +10,14 @@ Run modes:
   - Production: GMAIL_USER + GMAIL_APP_PASSWORD set → email is sent
   - Test:       BRIEFING_TEST=1 → writes briefing_preview.html for inspection
 """
-import os
-import sys
-import smtplib
+import json
 import logging
+import os
+import re
+import smtplib
+import sys
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -26,6 +28,7 @@ warnings.filterwarnings("ignore")
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 from src.config import (
@@ -53,6 +56,129 @@ _rd    = RegimeDetector()
 
 # ── BDI calibration anchors (from freight.py) ────────────────────────────────
 _BDI_FACTOR_MID = 118     # Mid-cycle BDI / BDRY multiplier
+
+# Persisted BDI history file — committed to repo so it accumulates across runs
+_BDI_HISTORY_PATH = Path(__file__).parent.parent / "data" / "bdi_history.json"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REAL BDI — scrape from tradingeconomics.com + persist history
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scrape_bdi() -> dict | None:
+    """
+    Scrape current Baltic Dry Index value from tradingeconomics.com.
+    Returns {"value": float, "source": str, "url": str} or None on failure.
+    """
+    url = "https://tradingeconomics.com/commodity/baltic"
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/120.0.0.0 Safari/537.36"),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate",
+        "DNT": "1",
+        "Upgrade-Insecure-Requests": "1",
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=15)
+        if r.status_code != 200:
+            log.warning(f"TE scrape: HTTP {r.status_code}")
+            return None
+        # The TEChartsMeta JSON block contains "last": <bdi_value>
+        m = re.search(r'"last":\s*([\d.]+)', r.text)
+        if not m:
+            log.warning("TE scrape: BDI value pattern not found")
+            return None
+        val = float(m.group(1))
+        if not (100 < val < 15000):
+            log.warning(f"TE scrape: BDI value {val} outside sanity range")
+            return None
+        return {"value": val, "source": "tradingeconomics.com", "url": url}
+    except Exception as e:
+        log.warning(f"BDI scrape failed: {e}")
+        return None
+
+
+def load_bdi_history() -> list[dict]:
+    if not _BDI_HISTORY_PATH.exists():
+        return []
+    try:
+        with _BDI_HISTORY_PATH.open("r", encoding="utf-8") as f:
+            return json.load(f).get("history", [])
+    except Exception as e:
+        log.warning(f"BDI history load failed: {e}")
+        return []
+
+
+def append_bdi_today(value: float) -> list[dict]:
+    """Upsert today's BDI value into the persisted history file."""
+    history = load_bdi_history()
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if history and history[-1].get("date") == today:
+        history[-1]["value"] = value
+    else:
+        history.append({"date": today, "value": value})
+    # Keep last 730 days (~2y)
+    history = history[-730:]
+    _BDI_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with _BDI_HISTORY_PATH.open("w", encoding="utf-8") as f:
+        json.dump(
+            {"history": history,
+             "updated_at": datetime.now(timezone.utc).isoformat()},
+            f, indent=2,
+        )
+    return history
+
+
+def bdi_changes(history: list[dict]) -> dict:
+    """Compute 1D / 5D / 30D / 1Y changes from BDI history."""
+    if not history:
+        return {}
+    cur = history[-1]["value"]
+    out = {"current": cur, "last_date": history[-1]["date"]}
+    for label, lookback in [("d1d", 1), ("d5d", 5), ("d30d", 30), ("d365d", 365)]:
+        if len(history) > lookback:
+            prev = history[-(lookback + 1)]["value"]
+            if prev:
+                out[label] = (cur / prev - 1) * 100
+    if len(history) >= 2:
+        vals = [h["value"] for h in history]
+        out["52w_high"] = max(vals[-365:]) if len(vals) >= 365 else max(vals)
+        out["52w_low"]  = min(vals[-365:]) if len(vals) >= 365 else min(vals)
+        out["pctile"]   = (sum(1 for v in vals if v <= cur) / len(vals)) * 100
+    return out
+
+
+def render_bdi_sparkline(history: list[dict],
+                         width: int = 220, height: int = 44,
+                         color: str = "#5b8cbf") -> str:
+    """Inline SVG sparkline of BDI history. Last 90 days; falls back gracefully."""
+    if len(history) < 2:
+        return ""
+    series = history[-90:]
+    values = [h["value"] for h in series]
+    v_min, v_max = min(values), max(values)
+    rng = v_max - v_min if v_max > v_min else 1.0
+    n   = len(values)
+    pts = " ".join(
+        f"{i * (width - 8) / max(n - 1, 1) + 4:.1f},"
+        f"{(1 - (v - v_min) / rng) * (height - 8) + 4:.1f}"
+        for i, v in enumerate(values)
+    )
+    last_x = (n - 1) * (width - 8) / max(n - 1, 1) + 4
+    last_y = (1 - (values[-1] - v_min) / rng) * (height - 8) + 4
+    last_col = "#16803c" if (len(values) > 1 and values[-1] >= values[-2]) else "#c92a2a"
+    # Build area path under line
+    area_pts = pts + f" {last_x:.1f},{height - 4:.1f} 4,{height - 4:.1f}"
+    return f"""
+    <svg width="{width}" height="{height}" viewBox="0 0 {width} {height}" xmlns="http://www.w3.org/2000/svg" style="display:block;">
+      <polygon points="{area_pts}" fill="{color}" fill-opacity="0.10"/>
+      <polyline points="{pts}" fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="{last_x:.1f}" cy="{last_y:.1f}" r="2.5" fill="{last_col}"/>
+    </svg>
+    """
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,16 +295,35 @@ def fetch_all() -> dict:
     ais_df      = _fetch_ais()
     regime      = _rd.detect_phase(composite) if not composite.empty else {}
 
+    # ── Real BDI: scrape + persist + compute changes ────────────────────────
+    bdi_scrape = scrape_bdi()
+    if bdi_scrape:
+        log.info(f"Real BDI scraped: {bdi_scrape['value']:.1f}")
+        bdi_history = append_bdi_today(bdi_scrape["value"])
+    else:
+        log.warning("BDI scrape failed — falling back to last cached history value")
+        bdi_history = load_bdi_history()
+        if bdi_history:
+            bdi_scrape = {
+                "value":  bdi_history[-1]["value"],
+                "source": "cached",
+                "url":    "https://tradingeconomics.com/commodity/baltic",
+            }
+    bdi_change = bdi_changes(bdi_history) if bdi_history else {}
+
     return {
-        "snapshot":   snap,
-        "composite":  composite,
-        "bdry_spot":  bdry_spot,
-        "bdry_fwd":   bdry_fwd,
-        "macro":      macro,
-        "articles":   articles or [],
-        "signals":    signals or [],
-        "ais":        ais_df,
-        "regime":     regime,
+        "snapshot":     snap,
+        "composite":    composite,
+        "bdry_spot":    bdry_spot,
+        "bdry_fwd":     bdry_fwd,
+        "macro":        macro,
+        "articles":     articles or [],
+        "signals":      signals or [],
+        "ais":          ais_df,
+        "regime":       regime,
+        "bdi":          bdi_scrape,
+        "bdi_history":  bdi_history,
+        "bdi_change":   bdi_change,
     }
 
 
@@ -201,6 +346,206 @@ def _section_header(label: str, emoji: str = "") -> str:
             f'text-transform:uppercase; font-weight:600; margin-bottom:10px;">{e}{label}</div>')
 
 
+def build_hero_tiles(data: dict) -> str:
+    """
+    Quick-glance tiles at the top of the email: BDI (hero, with sparkline),
+    BDRY paper, Brent, USD index. Designed for at-a-glance reading on mobile.
+    """
+    bdi     = data.get("bdi") or {}
+    bdi_chg = data.get("bdi_change") or {}
+    history = data.get("bdi_history") or []
+    spot    = data.get("bdry_spot")
+    snap    = data.get("snapshot", {})
+    macro   = data.get("macro", {})
+
+    # ── BDI hero tile (full width, with sparkline) ───────────────────────────
+    bdi_val   = bdi.get("value")
+    bdi_d1d   = bdi_chg.get("d1d")
+    bdi_d5d   = bdi_chg.get("d5d")
+    bdi_d30d  = bdi_chg.get("d30d")
+    sparkline = render_bdi_sparkline(history, width=240, height=44) if len(history) >= 2 else ""
+
+    if bdi_val:
+        d1d_html  = _arrow(bdi_d1d)  if bdi_d1d  is not None else '<span style="color:#9ba3b4;">—</span>'
+        d5d_html  = _arrow(bdi_d5d)  if bdi_d5d  is not None else '<span style="color:#9ba3b4;">—</span>'
+        d30d_html = _arrow(bdi_d30d) if bdi_d30d is not None else '<span style="color:#9ba3b4;">—</span>'
+        src       = bdi.get("source", "tradingeconomics.com")
+        bdi_url   = bdi.get("url", "https://tradingeconomics.com/commodity/baltic")
+        history_note = f"{len(history)} day{'s' if len(history)!=1 else ''} of history accumulated"
+
+        bdi_tile = f"""
+        <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background:linear-gradient(135deg,#1e3050 0%,#2d4a6e 100%); border-radius:8px; color:#ffffff; margin-bottom:14px;">
+          <tr><td style="padding:20px 24px;">
+            <table cellpadding="0" cellspacing="0" border="0" width="100%">
+              <tr>
+                <td valign="top" style="vertical-align:top;">
+                  <div style="font-size:10px; letter-spacing:0.16em; color:#a8c5e6; text-transform:uppercase; font-weight:600; font-family:'IBM Plex Mono',monospace;">
+                    🎯 Baltic Dry Index · Real Spot
+                  </div>
+                  <div style="font-size:36px; font-weight:700; color:#ffffff; margin-top:6px; line-height:1; font-family:'IBM Plex Mono',monospace;">
+                    {int(bdi_val):,}
+                  </div>
+                  <div style="font-size:11px; color:#a8c5e6; margin-top:6px;">
+                    1D {d1d_html} &nbsp;·&nbsp; 5D {d5d_html} &nbsp;·&nbsp; 30D {d30d_html}
+                  </div>
+                </td>
+                <td align="right" valign="top" style="vertical-align:top; text-align:right;">
+                  {sparkline}
+                  <div style="font-size:9px; color:#a8c5e6; margin-top:2px; font-family:'IBM Plex Mono',monospace;">
+                    {history_note}
+                  </div>
+                </td>
+              </tr>
+            </table>
+            <div style="margin-top:12px; padding-top:10px; border-top:1px solid rgba(168,197,230,0.2); font-size:10px; color:#a8c5e6;">
+              Source: <a href="{bdi_url}" style="color:#a8c5e6; text-decoration:underline;">{src}</a>
+              &nbsp;·&nbsp; Persisted history committed daily to repo
+            </div>
+          </td></tr>
+        </table>
+        """
+    else:
+        bdi_tile = f"""
+        <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#fafbfc; border:1px dashed #cbd5e0; border-radius:8px; margin-bottom:14px;">
+          <tr><td style="padding:16px 20px; text-align:center; color:#5a6275; font-size:12px;">
+            ⚠ BDI scrape unavailable today. Showing BDRY-derived implied BDI in sections below.
+          </td></tr>
+        </table>
+        """
+
+    # ── 3 supporting tiles: BDRY paper, Brent, USD ───────────────────────────
+    def _mini(title, value, delta, sub, color="#5b8cbf"):
+        delta_html = _arrow(delta) if delta is not None else '<span style="color:#9ba3b4;">—</span>'
+        return f"""
+        <td valign="top" style="vertical-align:top; padding:0 4px; width:33.3%;">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#ffffff; border:1px solid #e2e8f0; border-radius:6px;">
+            <tr><td style="padding:12px 14px;">
+              <div style="font-size:9px; letter-spacing:0.1em; color:{color}; text-transform:uppercase; font-weight:700; font-family:'IBM Plex Mono',monospace;">
+                {title}
+              </div>
+              <div style="font-size:20px; font-weight:700; color:#1a202c; margin-top:4px; font-family:'IBM Plex Mono',monospace;">
+                {value}
+              </div>
+              <div style="font-size:11px; margin-top:4px;">
+                {delta_html} &nbsp;<span style="color:#9ba3b4;">·</span>&nbsp;
+                <span style="color:#5a6275; font-size:10px;">{sub}</span>
+              </div>
+            </td></tr>
+          </table>
+        </td>
+        """
+
+    brent = macro.get("Brent") or {}
+    dxy   = macro.get("DXY")   or {}
+    bdry_d = (snap.get("BDRY", {}).get("delta_1d") or 0) * 100
+    bdry_val_str = f"${spot:.2f}" if spot else "N/A"
+    brent_val_str = f"${brent.get('value', 0):.0f}" if brent.get("value") else "N/A"
+    dxy_val_str   = f"{dxy.get('value', 0):.1f}"     if dxy.get("value")   else "N/A"
+
+    tiles_row = f"""
+    <table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:8px;">
+      <tr>
+        {_mini("BDRY · 5TC FFA",  bdry_val_str,  bdry_d if spot else None,  "5TC Capes paper")}
+        {_mini("Brent Crude",     brent_val_str, brent.get("d1d"),          "Bunker → VLSFO")}
+        {_mini("USD Index",       dxy_val_str,   dxy.get("d1d"),            "Commodity headwind")}
+      </tr>
+    </table>
+    """
+
+    return bdi_tile + tiles_row
+
+
+def build_real_bdi_section(data: dict) -> str:
+    """
+    Dedicated section for the real BDI series with full statistics block.
+    Shown after the executive summary for traders who want the deep dive.
+    """
+    bdi     = data.get("bdi") or {}
+    bdi_chg = data.get("bdi_change") or {}
+    history = data.get("bdi_history") or []
+
+    bdi_val = bdi.get("value")
+    if not bdi_val:
+        return ""
+
+    # Header stats
+    rows = []
+
+    def _stat_row(label, value, color="#1a202c"):
+        return f"""
+        <tr>
+          <td style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-size:12px; color:#5a6275;">{label}</td>
+          <td align="right" style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-weight:600; color:{color}; font-size:13px;">{value}</td>
+        </tr>
+        """
+
+    rows.append(_stat_row(
+        "Current Level",
+        f"<b>{int(bdi_val):,}</b>",
+        "#0066cc",
+    ))
+    if bdi_chg.get("d1d") is not None:
+        col = "#16803c" if bdi_chg["d1d"] >= 0 else "#c92a2a"
+        rows.append(_stat_row("1-Day Change", f"{bdi_chg['d1d']:+.2f}%", col))
+    if bdi_chg.get("d5d") is not None:
+        col = "#16803c" if bdi_chg["d5d"] >= 0 else "#c92a2a"
+        rows.append(_stat_row("5-Day Change", f"{bdi_chg['d5d']:+.2f}%", col))
+    if bdi_chg.get("d30d") is not None:
+        col = "#16803c" if bdi_chg["d30d"] >= 0 else "#c92a2a"
+        rows.append(_stat_row("30-Day Change", f"{bdi_chg['d30d']:+.2f}%", col))
+    if bdi_chg.get("d365d") is not None:
+        col = "#16803c" if bdi_chg["d365d"] >= 0 else "#c92a2a"
+        rows.append(_stat_row("1-Year Change", f"{bdi_chg['d365d']:+.2f}%", col))
+    if bdi_chg.get("52w_high") is not None:
+        rows.append(_stat_row("52W High",
+                              f"{int(bdi_chg['52w_high']):,}"))
+    if bdi_chg.get("52w_low") is not None:
+        rows.append(_stat_row("52W Low",
+                              f"{int(bdi_chg['52w_low']):,}"))
+    if bdi_chg.get("pctile") is not None:
+        col = ("#c92a2a" if bdi_chg["pctile"] >= 80 else
+               "#16803c" if bdi_chg["pctile"] <= 20 else "#1a202c")
+        rows.append(_stat_row(
+            "Percentile (full history)",
+            f"{bdi_chg['pctile']:.0f}th",
+            col,
+        ))
+    rows.append(_stat_row(
+        "Days in history",
+        f"{len(history)}",
+        "#9ba3b4",
+    ))
+
+    big_chart = render_bdi_sparkline(history, width=420, height=80, color="#5b8cbf")
+
+    last_date = bdi_chg.get("last_date", "")
+
+    return f"""
+    {_section_header("Baltic Dry Index — Real Spot Series", "📉")}
+    <p style="font-size:12px; color:#5a6275; margin:0 0 12px 0;">
+      Scraped daily from <a href="https://tradingeconomics.com/commodity/baltic" style="color:#5b8cbf; text-decoration:none;">tradingeconomics.com</a>.
+      Historical series persists in the repo's <code style="background:#f7f9fc; padding:2px 5px; border-radius:3px; font-size:11px;">data/bdi_history.json</code> — grows by one observation per morning. Last update: <b>{last_date}</b>.
+    </p>
+    <table cellpadding="0" cellspacing="0" border="0" width="100%">
+      <tr>
+        <td valign="top" style="vertical-align:top; width:55%; padding-right:14px;">
+          <div style="background:#fafbfc; border:1px solid #e2e8f0; border-radius:6px; padding:14px; text-align:center;">
+            {big_chart}
+            <div style="font-size:10px; color:#9ba3b4; margin-top:6px; font-family:'IBM Plex Mono',monospace;">
+              Last {min(len(history), 90)} days
+            </div>
+          </div>
+        </td>
+        <td valign="top" style="vertical-align:top; width:45%;">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0; border-radius:6px;">
+            {''.join(rows)}
+          </table>
+        </td>
+      </tr>
+    </table>
+    """
+
+
 def build_overnight_context(data: dict) -> str:
     """
     Narrative prose paragraph describing the overnight dry bulk market state.
@@ -217,34 +562,66 @@ def build_overnight_context(data: dict) -> str:
 
     sentences: list[str] = []
 
-    # ── Lead: BDRY direction + cycle phase ───────────────────────────────────
+    # ── Lead: REAL BDI first (if available), then BDRY paper market ──────────
+    bdi        = data.get("bdi") or {}
+    bdi_chg    = data.get("bdi_change") or {}
+    bdi_val    = bdi.get("value")
+    bdi_d1d    = bdi_chg.get("d1d")
+    bdi_d5d    = bdi_chg.get("d5d")
+    pctile     = bdi_chg.get("pctile")
+
     bdry     = snap.get("BDRY", {})
     bdry_d1d = bdry.get("delta_1d", 0) or 0
     bdry_d5d = bdry.get("delta_5d", 0) or 0
 
-    if spot:
-        if   bdry_d1d >  0.015: action = "extended sharply higher overnight"
-        elif bdry_d1d >  0.005: action = "edged higher overnight"
-        elif bdry_d1d < -0.015: action = "sold off overnight"
-        elif bdry_d1d < -0.005: action = "drifted lower overnight"
-        else:                   action = "traded sideways overnight"
+    cycle_phrase = {
+        "EXPANSION":   " with the cycle in expansion territory",
+        "PEAK":        " though the cycle is showing late-stage peak signals",
+        "CONTRACTION": " amid an active cycle contraction",
+        "TROUGH":      " near cycle-trough levels",
+        "NEUTRAL":     "",
+    }.get(regime.get("phase", ""), "")
 
-        cycle_phrase = {
-            "EXPANSION":   " with the cycle still in expansion territory",
-            "PEAK":        " though the cycle is showing late-stage peak signals",
-            "CONTRACTION": " amid an active cycle contraction",
-            "TROUGH":      " near cycle-trough levels",
-            "NEUTRAL":     "",
-        }.get(regime.get("phase", ""), "")
+    # Pick the dominant 1D move to colour the narrative — prefer real BDI
+    primary_d1d = bdi_d1d if bdi_d1d is not None else bdry_d1d * 100
+    if   primary_d1d >  1.5: action = "extended sharply higher overnight"
+    elif primary_d1d >  0.5: action = "edged higher overnight"
+    elif primary_d1d < -1.5: action = "sold off overnight"
+    elif primary_d1d < -0.5: action = "drifted lower overnight"
+    else:                    action = "traded sideways overnight"
 
+    if bdi_val:
         five_day = ""
-        if   bdry_d5d >  0.05: five_day = f" (+{bdry_d5d*100:.1f}% over 5 sessions — momentum building)"
-        elif bdry_d5d < -0.05: five_day = f" ({bdry_d5d*100:+.1f}% over 5 sessions — sustained pressure)"
-        elif abs(bdry_d5d) >= 0.02: five_day = f" ({bdry_d5d*100:+.1f}% on the week)"
+        if bdi_d5d is not None:
+            if   bdi_d5d >  5: five_day = f" (+{bdi_d5d:.1f}% over 5 sessions — momentum building)"
+            elif bdi_d5d < -5: five_day = f" ({bdi_d5d:+.1f}% over 5 sessions — sustained pressure)"
+            elif abs(bdi_d5d) >= 2: five_day = f" ({bdi_d5d:+.1f}% on the week)"
 
+        pct_phrase = ""
+        if pctile is not None:
+            if   pctile >= 80: pct_phrase = f" — currently in the {pctile:.0f}th percentile of recorded history (rich)"
+            elif pctile <= 20: pct_phrase = f" — currently in the {pctile:.0f}th percentile (cheap)"
+
+        d1d_str = f" ({bdi_d1d:+.2f}% 1D)" if bdi_d1d is not None else ""
+        sentences.append(
+            f"<b>Baltic Dry Index</b> {action} at <b>{int(bdi_val):,}</b>{d1d_str}{five_day}"
+            f"{cycle_phrase}{pct_phrase}."
+        )
+
+        # Add BDRY paper line as a separate sentence so it doesn't crowd the lead
+        if spot:
+            bdry_dir = ("firmed" if bdry_d1d > 0.005 else
+                        "softened" if bdry_d1d < -0.005 else "held steady")
+            sentences.append(
+                f"BDRY ETF — the 5TC Capes / 4TC Panamax FFA-backed product, "
+                f"a forward-looking proxy — {bdry_dir} to <b>${spot:.2f}</b> "
+                f"({bdry_d1d*100:+.2f}%), implying a Day-+30 paper BDI around "
+                f"<b>{int(spot * _BDI_FACTOR_MID):,}</b>."
+            )
+    elif spot:
         sentences.append(
             f"Dry bulk paper {action} — BDRY ETF (closest free 5TC Capes FFA proxy) "
-            f"settled at <b>${spot:.2f}</b>{five_day}, implying a BDI level around "
+            f"settled at <b>${spot:.2f}</b>, implying a BDI level around "
             f"<b>{int(spot * _BDI_FACTOR_MID):,}</b>{cycle_phrase}."
         )
 
@@ -850,7 +1227,13 @@ def build_email(data: dict) -> tuple[str, str]:
     bdry_v = bdry.get("value")
     bdry_d = bdry.get("delta_1d")
 
-    subject_parts = [f"🚢 Dry Bulk Briefing · {today.strftime('%a %d %b')}"]
+    # Subject: lead with REAL BDI if available, else BDRY
+    bdi_val = (data.get("bdi") or {}).get("value")
+    bdi_d1d = (data.get("bdi_change") or {}).get("d1d")
+    subject_parts = [f"🚢 Dry Bulk · {today.strftime('%a %d %b')}"]
+    if bdi_val is not None:
+        bdi_chg_str = f" ({bdi_d1d:+.2f}%)" if bdi_d1d is not None else ""
+        subject_parts.append(f"BDI {int(bdi_val):,}{bdi_chg_str}")
     if bdry_v and bdry_d is not None:
         subject_parts.append(f"BDRY ${bdry_v:.2f} ({bdry_d*100:+.2f}%)")
     regime = data.get("regime", {})
@@ -870,21 +1253,29 @@ def build_email(data: dict) -> tuple[str, str]:
     <tr><td align="center">
       <table cellpadding="0" cellspacing="0" border="0" width="720" style="max-width:720px; background:#ffffff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.06); overflow:hidden;">
 
-        <tr><td style="padding:28px 32px 18px; border-bottom:3px solid #1e3050;">
-          <div style="font-size:11px; letter-spacing:0.14em; color:#5b8cbf; text-transform:uppercase; font-weight:700; font-family:'IBM Plex Mono',monospace;">
-            FreightIQ · Dry Bulk Morning Briefing
-          </div>
-          <div style="font-size:23px; color:#1a202c; font-weight:700; margin-top:8px; line-height:1.2;">
-            {date_str}
-          </div>
-          <div style="font-size:13px; color:#5a6275; margin-top:6px;">
-            Geneva · 07:30 CET · ~10 min read
-          </div>
+        <tr><td style="padding:28px 32px 18px; background:linear-gradient(180deg,#ffffff 0%,#fafbfc 100%); border-bottom:3px solid #1e3050;">
+          <table cellpadding="0" cellspacing="0" border="0" width="100%">
+            <tr>
+              <td valign="top">
+                <div style="font-size:11px; letter-spacing:0.14em; color:#5b8cbf; text-transform:uppercase; font-weight:700; font-family:'IBM Plex Mono',monospace;">
+                  FreightIQ · Dry Bulk Morning Briefing
+                </div>
+                <div style="font-size:24px; color:#1a202c; font-weight:700; margin-top:8px; line-height:1.2;">
+                  {date_str}
+                </div>
+                <div style="font-size:13px; color:#5a6275; margin-top:6px;">
+                  Geneva · 07:30 CET · ~10 min read
+                </div>
+              </td>
+            </tr>
+          </table>
         </td></tr>
 
-        <tr><td style="padding:24px 32px;">{build_overnight_context(data)}</td></tr>
+        <tr><td style="padding:20px 32px 8px;">{build_hero_tiles(data)}</td></tr>
+        <tr><td style="padding:16px 32px;">{build_overnight_context(data)}</td></tr>
         <tr><td style="padding:0 32px 24px; background:#fafbfc;">{build_exec_summary(data)}</td></tr>
-        <tr><td style="padding:24px 32px; background:#ffffff;">{build_levels_table(data)}</td></tr>
+        <tr><td style="padding:24px 32px; background:#ffffff;">{build_real_bdi_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px; background:#ffffff;">{build_levels_table(data)}</td></tr>
         <tr><td style="padding:0 32px 24px;">{build_ffa_curve(data)}</td></tr>
         <tr><td style="padding:0 32px 24px;">{build_supply_section(data)}</td></tr>
         <tr><td style="padding:0 32px 24px;">{build_demand_section(data)}</td></tr>
