@@ -67,6 +67,12 @@ PORT_ZONES = {
     "Bab el-Mandeb":       ( 11.5,  42.5,  13.5,  44.5),
     "Cape of Good Hope":   (-35.5,  17.5, -32.5,  21.0),
     "Strait of Hormuz":    ( 25.5,  55.5,  27.5,  57.5),
+    # ── Ag-export ports (LDC-relevant) ─────────────────────────────────────
+    "Santos (BR ag)":           (-24.5, -46.5, -23.6, -46.0),
+    "Paranaguá (BR ag)":        (-25.7, -48.7, -25.3, -48.3),
+    "NOLA / US Gulf":           ( 28.5, -90.5,  30.5, -88.5),
+    "Constanța (Black Sea)":    ( 43.8,  28.4,  44.4,  29.0),
+    "Rosario / Up-River (AR)":  (-34.5, -61.0, -32.0, -58.0),
 }
 
 # ─── Baltic Exchange benchmark route definitions ───────────────────────────────

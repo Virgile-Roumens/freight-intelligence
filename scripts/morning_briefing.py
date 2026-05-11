@@ -151,6 +151,215 @@ def bdi_changes(history: list[dict]) -> dict:
     return out
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# BUNKER PRICES — scrape VLSFO by port from shipandbunker.com
+# ─────────────────────────────────────────────────────────────────────────────
+
+def scrape_bunker_prices() -> dict:
+    """
+    Scrape VLSFO (0.5% sulfur, IMO-2020 compliant) bunker prices for major
+    ports from shipandbunker.com. Returns {port: usd_per_mt}.
+    """
+    url = "https://shipandbunker.com/prices"
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 Chrome/120.0.0.0"),
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=12)
+        if r.status_code != 200:
+            return {}
+        # The page lists each port name followed by its VLSFO price (first numeric value)
+        out = {}
+        for port in ("Singapore", "Rotterdam", "Houston", "Fujairah", "Hong Kong"):
+            pattern = rf'class="[^"]*">({port})<[^>]+>[^<]*<[^>]+>(\d+\.?\d*)'
+            m = re.search(pattern, r.text)
+            if m:
+                price = float(m.group(2))
+                if 100 < price < 3000:
+                    out[port] = price
+        return out
+    except Exception as e:
+        log.warning(f"Bunker scrape failed: {e}")
+        return {}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ECONOMIC CALENDAR — hardcoded recurring releases relevant to dry bulk
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Each entry: (kind, day_pattern, weekday, time_cet, name, importance, why_it_matters, url)
+#   kind: "monthly" | "weekly" | "biweekly"
+#   day_pattern: int (day of month) | "first_friday" | None
+#   weekday: 0=Mon..6=Sun | None
+_CALENDAR = [
+    # Weekly
+    ("weekly", None, 2, "16:30 CET",
+     "EIA Crude Oil Stocks",        "high",
+     "Bunker proxy via Brent — moves voyage TCEs",
+     "https://www.eia.gov/petroleum/supply/weekly/"),
+    ("weekly", None, 3, "16:00 CET",
+     "EIA Natural Gas Storage",     "medium",
+     "Gas-coal substitution dynamics affect thermal coal demand",
+     "https://ir.eia.gov/ngs/ngs.html"),
+    ("weekly", None, 4, "21:30 CET",
+     "CFTC Commitment of Traders",  "medium",
+     "Speculative positioning in grains & energy",
+     "https://www.cftc.gov/MarketReports/CommitmentsofTraders/"),
+    # Monthly — China bloc
+    ("monthly", 7, None, "03:00 CET",
+     "China Trade Balance & Exports/Imports",
+     "high",
+     "Iron ore + grain import pace — direct dry bulk demand",
+     "https://www.tradingeconomics.com/china/balance-of-trade"),
+    ("monthly", 10, None, "03:30 CET",
+     "China CPI / PPI",             "high",
+     "Demand health signal · industrial pricing power",
+     "https://www.tradingeconomics.com/china/inflation-cpi"),
+    ("monthly", 15, None, "03:00 CET",
+     "China Industrial Production / Retail",
+     "high",
+     "Capesize bellwether — steel mill output ties to iron ore",
+     "https://www.tradingeconomics.com/china/industrial-production"),
+    # Monthly — USDA & ag
+    ("monthly", 12, None, "18:00 CET",
+     "USDA WASDE Report",           "high",
+     "Global crop S&D — drives grain trade flows & Panamax/Supramax routes",
+     "https://www.usda.gov/oce/commodity/wasde"),
+    ("monthly", 25, None, "14:30 CET",
+     "USDA Cattle on Feed",         "low",
+     "Feed grain demand signal (corn → US Gulf exports)",
+     "https://usda.library.cornell.edu/concern/publications/m326m174z"),
+    # Monthly — US macro
+    ("monthly", "first_friday", None, "14:30 CET",
+     "US Nonfarm Payrolls",         "high",
+     "Risk sentiment & USD direction · headwind/tailwind for commodities",
+     "https://www.bls.gov/news.release/empsit.toc.htm"),
+    ("monthly", 13, None, "14:30 CET",
+     "US CPI Inflation",            "high",
+     "Fed path · USD index · commodity flows",
+     "https://www.bls.gov/cpi/"),
+    ("monthly", 14, None, "14:30 CET",
+     "US Retail Sales",             "medium",
+     "Consumer demand pulse for finished goods imports",
+     "https://www.census.gov/retail/index.html"),
+    ("monthly", 1, None, "03:30 CET",
+     "China Caixin Manufacturing PMI",
+     "high",
+     "Leading indicator for steel mills & freight demand",
+     "https://www.tradingeconomics.com/china/manufacturing-pmi"),
+    # Quarterly-ish
+    ("monthly", 28, None, "01:50 CET",
+     "Japan Industrial Production", "medium",
+     "Capesize iron ore import demand (Pilbara → Japan)",
+     "https://www.tradingeconomics.com/japan/industrial-production"),
+]
+
+
+def economic_calendar_today(dt: datetime) -> list[dict]:
+    """Return calendar items scheduled for today."""
+    weekday = dt.weekday()  # 0=Mon..6=Sun
+    day     = dt.day
+    is_first_friday = (weekday == 4 and 1 <= day <= 7)
+
+    out = []
+    for entry in _CALENDAR:
+        kind, day_pat, wd, time_str, name, importance, note, url = entry
+        match = False
+        if kind == "weekly" and wd == weekday:
+            match = True
+        elif kind == "monthly":
+            if day_pat == "first_friday" and is_first_friday:
+                match = True
+            elif isinstance(day_pat, int) and day_pat == day:
+                match = True
+        if match:
+            out.append({
+                "name": name, "time": time_str, "importance": importance,
+                "note": note, "url": url,
+            })
+    return out
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# LLM NARRATIVE — optional Claude API integration (graceful no-op without key)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def generate_llm_narrative(data: dict) -> str | None:
+    """
+    If ANTHROPIC_API_KEY is set, generate a polished executive summary
+    paragraph via Claude. Returns None if no key or on error (caller falls
+    back to rule-based narrative).
+    """
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from anthropic import Anthropic
+    except ImportError:
+        log.info("anthropic SDK not installed — LLM narrative disabled")
+        return None
+
+    bdi      = data.get("bdi") or {}
+    bdi_chg  = data.get("bdi_change") or {}
+    macro    = data.get("macro", {})
+    snap     = data.get("snapshot", {})
+    regime   = data.get("regime", {})
+    sigs     = data.get("signals", [])
+    spot     = data.get("bdry_spot")
+    fwd      = data.get("bdry_fwd", [])
+    bunker   = data.get("bunker", {})
+
+    facts = {
+        "bdi_now":         bdi.get("value"),
+        "bdi_1d_pct":      bdi_chg.get("d1d"),
+        "bdi_5d_pct":      bdi_chg.get("d5d"),
+        "bdi_30d_pct":     bdi_chg.get("d30d"),
+        "bdi_percentile":  bdi_chg.get("pctile"),
+        "bdry_spot":       spot,
+        "bdry_1d_pct":     (snap.get("BDRY", {}).get("delta_1d") or 0) * 100,
+        "bdry_fwd_jun":    fwd[0]["fwd"] if fwd else None,
+        "regime":          regime.get("label"),
+        "brent_usd_bbl":   (macro.get("Brent") or {}).get("value"),
+        "brent_1d_pct":    (macro.get("Brent") or {}).get("d1d"),
+        "dxy":             (macro.get("DXY") or {}).get("value"),
+        "dxy_1d_pct":      (macro.get("DXY") or {}).get("d1d"),
+        "vale_1d_pct":     (macro.get("VALE") or {}).get("d1d"),
+        "corn_1d_pct":     (macro.get("Corn") or {}).get("d1d"),
+        "wheat_1d_pct":    (macro.get("Wheat") or {}).get("d1d"),
+        "soy_1d_pct":      (macro.get("Soybean") or {}).get("d1d"),
+        "bunker_singapore": bunker.get("Singapore"),
+        "bunker_rotterdam": bunker.get("Rotterdam"),
+        "top_signal":      sigs[0].get("text")[:200] if sigs else None,
+    }
+
+    prompt = f"""You are a senior dry bulk freight analyst at a global agricultural commodity merchant in Geneva.
+Write a 3-4 sentence overnight market commentary for the morning desk meeting. Focus on what changed and the actionable read for the freight book (Capesize/Panamax/Supramax).
+
+Style: institutional, concise, no hedging, no marketing fluff. Reference real numbers. Mention LDC-relevant context (grain trade, ag flows, Brazil/US Gulf/Black Sea) where relevant. End with one specific item to watch today.
+
+Today's facts (JSON):
+{json.dumps(facts, indent=2)}
+
+Output ONLY the paragraph in HTML (use <b> for emphasis, no other tags). No preamble."""
+
+    try:
+        client = Anthropic(api_key=api_key)
+        msg = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=400,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text.strip()
+    except Exception as e:
+        log.warning(f"LLM narrative failed: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SVG SPARKLINE
+# ─────────────────────────────────────────────────────────────────────────────
+
 def render_bdi_sparkline(history: list[dict],
                          width: int = 220, height: int = 44,
                          color: str = "#5b8cbf") -> str:
@@ -311,19 +520,42 @@ def fetch_all() -> dict:
             }
     bdi_change = bdi_changes(bdi_history) if bdi_history else {}
 
+    # ── YoY context via BDRY 1-year-old close (synthetic BDI proxy) ─────────
+    yoy_bdi_proxy = None
+    try:
+        bdry_1y = yf.download("BDRY", period="2y", auto_adjust=True, progress=False)
+        if isinstance(bdry_1y.columns, pd.MultiIndex):
+            bdry_1y.columns = bdry_1y.columns.droplevel(1)
+        s = bdry_1y["Close"].dropna()
+        if len(s) > 252:
+            yoy_bdi_proxy = float(s.iloc[-252]) * _BDI_FACTOR_MID  # ~1 trading year ago
+    except Exception:
+        pass
+
+    # ── Bunker prices by port (live scrape) ──────────────────────────────────
+    bunker = scrape_bunker_prices()
+    if bunker:
+        log.info(f"Bunker prices scraped: {len(bunker)} ports")
+
+    # ── Economic calendar ────────────────────────────────────────────────────
+    calendar = economic_calendar_today(datetime.now(ZoneInfo("Europe/Zurich")))
+
     return {
-        "snapshot":     snap,
-        "composite":    composite,
-        "bdry_spot":    bdry_spot,
-        "bdry_fwd":     bdry_fwd,
-        "macro":        macro,
-        "articles":     articles or [],
-        "signals":      signals or [],
-        "ais":          ais_df,
-        "regime":       regime,
-        "bdi":          bdi_scrape,
-        "bdi_history":  bdi_history,
-        "bdi_change":   bdi_change,
+        "snapshot":      snap,
+        "composite":     composite,
+        "bdry_spot":     bdry_spot,
+        "bdry_fwd":      bdry_fwd,
+        "macro":         macro,
+        "articles":      articles or [],
+        "signals":       signals or [],
+        "ais":           ais_df,
+        "regime":        regime,
+        "bdi":           bdi_scrape,
+        "bdi_history":   bdi_history,
+        "bdi_change":    bdi_change,
+        "yoy_bdi_proxy": yoy_bdi_proxy,
+        "bunker":        bunker,
+        "calendar":      calendar,
     }
 
 
@@ -344,6 +576,308 @@ def _section_header(label: str, emoji: str = "") -> str:
     e = f"{emoji} " if emoji else ""
     return (f'<div style="font-size:11px; letter-spacing:0.1em; color:#5b8cbf; '
             f'text-transform:uppercase; font-weight:600; margin-bottom:10px;">{e}{label}</div>')
+
+
+def _sentiment_chip(level: str) -> str:
+    """Returns a small inline sentiment chip: 🟢 BULL / 🟡 NEUTRAL / 🔴 BEAR."""
+    if   level == "bull":    txt, col, bg = "● BULL",    "#16803c", "#d4f4dd"
+    elif level == "bear":    txt, col, bg = "● BEAR",    "#c92a2a", "#fde0e0"
+    elif level == "tight":   txt, col, bg = "● TIGHT",   "#c92a2a", "#fde0e0"
+    elif level == "slack":   txt, col, bg = "● SLACK",   "#16803c", "#d4f4dd"
+    elif level == "neutral": txt, col, bg = "● NEUTRAL", "#a07c00", "#fff5d6"
+    else:                    return ""
+    return (
+        f'<span style="display:inline-block; font-size:9px; font-weight:700; '
+        f'letter-spacing:0.08em; color:{col}; background:{bg}; padding:2px 7px; '
+        f'border-radius:10px; margin-left:8px; vertical-align:middle; '
+        f'font-family:\'IBM Plex Mono\',monospace;">{txt}</span>'
+    )
+
+
+def _section_header_chip(label: str, emoji: str = "", chip: str = "") -> str:
+    """Section header with optional sentiment chip on the right."""
+    e = f"{emoji} " if emoji else ""
+    chip_html = _sentiment_chip(chip) if chip else ""
+    return (
+        f'<div style="font-size:11px; letter-spacing:0.1em; color:#5b8cbf; '
+        f'text-transform:uppercase; font-weight:600; margin-bottom:10px;">'
+        f'{e}{label}{chip_html}</div>'
+    )
+
+
+def build_subsegment_section(data: dict) -> str:
+    """
+    Sub-segment performance using shipping-equity proxies (BCI/BPI/BSI are
+    paywalled — equities track them closely enough to be directionally useful).
+    """
+    macro = data["macro"]
+    snap  = data["snapshot"]
+
+    # Map proxies to vessel segment
+    segments = [
+        ("Capesize",   ["BHP", "VALE"],         "Iron ore charterer mega-fleet · Pilbara/Brazil routes"),
+        ("Panamax",    ["NMM"],                 "Diversified MLP · grain/coal flexible book"),
+        ("Supramax",   ["EGLE"],                "Pure-play Supramax · minor bulk & grain"),
+        ("Diversified",["SBLK"],                "Star Bulk — largest US-listed dry bulk operator"),
+    ]
+
+    rows = []
+    for seg_name, tickers, note in segments:
+        # Average daily move across the proxy tickers
+        d1s, d5s, vals = [], [], []
+        for tk in tickers:
+            m = macro.get(tk) or {}
+            v = m.get("value")
+            if v is not None:
+                vals.append(v)
+                if m.get("d1d") is not None: d1s.append(m["d1d"])
+                if m.get("d5d") is not None: d5s.append(m["d5d"])
+            # Also try snapshot for additional tickers
+            s = snap.get(tk) or {}
+            sv = s.get("value")
+            if sv is not None and v is None:
+                vals.append(sv)
+                if s.get("delta_1d") is not None: d1s.append(s["delta_1d"] * 100)
+                if s.get("delta_5d") is not None: d5s.append(s["delta_5d"] * 100)
+
+        if not vals:
+            continue
+        avg_d1 = sum(d1s) / len(d1s) if d1s else None
+        avg_d5 = sum(d5s) / len(d5s) if d5s else None
+
+        # Sentiment based on combined 1D + 5D move
+        score = (avg_d1 or 0) + (avg_d5 or 0) * 0.3
+        if   score >  1.5: chip = "bull"
+        elif score < -1.5: chip = "bear"
+        else:              chip = "neutral"
+
+        chip_html = _sentiment_chip(chip)
+        tk_str = " · ".join(tickers)
+        rows.append(f"""
+        <tr>
+          <td style="padding:10px 12px; border-bottom:1px solid #f0f2f5;">
+            <div style="font-weight:600; font-size:13px;">{seg_name}{chip_html}</div>
+            <div style="font-size:10px; color:#9ba3b4; font-family:'IBM Plex Mono',monospace;">{tk_str}</div>
+          </td>
+          <td align="right" style="padding:10px 12px; border-bottom:1px solid #f0f2f5;">{_arrow(avg_d1)}</td>
+          <td align="right" style="padding:10px 12px; border-bottom:1px solid #f0f2f5;">{_arrow(avg_d5)}</td>
+          <td style="padding:10px 12px; border-bottom:1px solid #f0f2f5; font-size:11px; color:#5a6275;">{note}</td>
+        </tr>
+        """)
+
+    if not rows:
+        return ""
+
+    return f"""
+    {_section_header_chip("Sub-Segment Performance · Equity Proxies", "📐")}
+    <p style="font-size:11px; color:#5a6275; margin:0 0 10px 0;">
+      Real Baltic sub-indices (BCI · BPI · BSI · BHSI) require Baltic Exchange subscription. Below: equity proxies
+      that historically track each sub-segment, used as a directional proxy. Sentiment chip combines 1D + 5D moves.
+    </p>
+    <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0; border-radius:6px;">
+      <thead>
+        <tr style="background:#f7f9fc; font-size:10px; color:#5a6275; text-transform:uppercase;">
+          <th align="left"  style="padding:8px 12px;">Segment / Proxies</th>
+          <th align="right" style="padding:8px 12px;">1D</th>
+          <th align="right" style="padding:8px 12px;">5D</th>
+          <th align="left"  style="padding:8px 12px;">Context</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+    """
+
+
+def build_ag_ports_section(data: dict) -> str:
+    """
+    Promote ag-relevant port congestion (LDC trades grains heavily).
+    Highlights Santos, Paranaguá, NOLA, Constanța, Rosario, Tubarão.
+    """
+    ais_df = data.get("ais")
+    if ais_df is None or ais_df.empty:
+        return ""
+
+    try:
+        from src.data.ais_data import get_port_zone_counts
+        port_df = get_port_zone_counts(ais_df)
+    except Exception:
+        return ""
+
+    if port_df.empty:
+        return ""
+
+    AG_PORTS = [
+        ("Santos (BR ag)",        "🇧🇷", "Brazil soybean/corn — Panamax"),
+        ("Paranaguá (BR ag)",     "🇧🇷", "Brazil soybean/corn — Panamax"),
+        ("Tubarao / Vitoria",     "🇧🇷", "Iron ore — Capesize export hub"),
+        ("NOLA / US Gulf",        "🇺🇸", "US corn/soy/wheat — Panamax"),
+        ("Constanța (Black Sea)", "🇷🇴", "Black Sea grain — Panamax/Supramax"),
+        ("Rosario / Up-River (AR)","🇦🇷","Argentine grain/soymeal — Supramax/Panamax"),
+        ("Qingdao / N.China",     "🇨🇳", "China iron ore discharge — Capesize"),
+        ("Port Hedland",          "🇦🇺", "Iron ore — Capesize export hub"),
+    ]
+
+    rows = []
+    for port_name, flag, note in AG_PORTS:
+        match = port_df[port_df["Port Zone"] == port_name]
+        if match.empty:
+            continue
+        r = match.iloc[0]
+        live     = int(r.get("Live (AIS)", 0))
+        anchored = int(r.get("Anchor/Moored", 0))
+        wait     = str(r.get("Est. Wait (days)", "—"))
+        status   = str(r.get("Est. Status", "—"))
+
+        if   status == "Heavy":    chip = "tight"
+        elif status == "Light":    chip = "slack"
+        else:                      chip = "neutral"
+
+        rows.append(f"""
+        <tr>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5;">
+            <span style="font-size:14px; margin-right:4px;">{flag}</span>
+            <span style="font-weight:600; font-size:12px;">{port_name}</span>
+          </td>
+          <td align="right" style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-weight:600; color:#0066cc;">{live}</td>
+          <td align="right" style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; color:#d29922;">{anchored}</td>
+          <td align="right" style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-size:11px;">{wait} d</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5;">{_sentiment_chip(chip)}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-size:10px; color:#5a6275;">{note}</td>
+        </tr>
+        """)
+
+    if not rows:
+        return ""
+
+    return f"""
+    {_section_header_chip("Ag & Iron-Ore Port Queue Tracker", "🌾")}
+    <p style="font-size:11px; color:#5a6275; margin:0 0 10px 0;">
+      Live AIS-detected vessel counts at LDC-relevant export/import zones. Queues at Brazilian / US Gulf / Black Sea ports
+      tighten effective Panamax supply for grain trades. Iron-ore ports tie directly to Capesize demand.
+    </p>
+    <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0; border-radius:6px;">
+      <thead>
+        <tr style="background:#f7f9fc; font-size:10px; color:#5a6275; text-transform:uppercase;">
+          <th align="left"  style="padding:8px 12px;">Port</th>
+          <th align="right" style="padding:8px 12px;">Live</th>
+          <th align="right" style="padding:8px 12px;">Wait</th>
+          <th align="right" style="padding:8px 12px;">Est. Days</th>
+          <th align="left"  style="padding:8px 12px;">Status</th>
+          <th align="left"  style="padding:8px 12px;">Context</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+    """
+
+
+def build_bunker_section(data: dict) -> str:
+    """VLSFO bunker prices by port (scraped from shipandbunker.com)."""
+    bunker = data.get("bunker") or {}
+    brent  = (data.get("macro") or {}).get("Brent") or {}
+    if not bunker:
+        return ""
+
+    rows = []
+    for port in ["Singapore", "Rotterdam", "Houston", "Fujairah", "Hong Kong"]:
+        price = bunker.get(port)
+        if price is None:
+            continue
+        # Implied spread vs Brent (illustrative)
+        implied = brent.get("value", 0) * 6.4 if brent.get("value") else None
+        spread = (price - implied) if implied else None
+        spread_str = ""
+        if spread is not None:
+            spread_col = "#c92a2a" if spread > 30 else ("#16803c" if spread < -30 else "#5a6275")
+            spread_str = (f'<span style="color:{spread_col}; '
+                          f'font-family:\'IBM Plex Mono\',monospace; font-size:11px;">'
+                          f'{spread:+.0f} vs Brent×6.4</span>')
+
+        # Trader note per port
+        note = {
+            "Singapore": "Asia bunker hub · key for Pilbara/Brazil → China voyages",
+            "Rotterdam": "NW Europe bunker · ARA range · Black Sea grain return legs",
+            "Houston":   "US Gulf bunker · NOLA grain export voyages",
+            "Fujairah":  "Middle East bunker · Hormuz transit & Indian Ocean routes",
+            "Hong Kong": "South China bunker hub",
+        }.get(port, "")
+
+        rows.append(f"""
+        <tr>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-weight:600; font-size:12px;">{port}</td>
+          <td align="right" style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-weight:600;">${price:.1f}/mt</td>
+          <td align="right" style="padding:8px 12px; border-bottom:1px solid #f0f2f5;">{spread_str}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-size:11px; color:#5a6275;">{note}</td>
+        </tr>
+        """)
+
+    if not rows:
+        return ""
+
+    return f"""
+    {_section_header_chip("VLSFO Bunker Prices · by Port", "⛽")}
+    <p style="font-size:11px; color:#5a6275; margin:0 0 10px 0;">
+      Live VLSFO (0.5% sulfur) prices scraped from <a href="https://shipandbunker.com/prices" style="color:#5b8cbf;">shipandbunker.com</a>.
+      Spread column shows how far each port is from a flat <b>Brent × 6.4</b> approximation — useful when comparing voyage TCEs across bunker hubs.
+    </p>
+    <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0; border-radius:6px;">
+      <thead>
+        <tr style="background:#f7f9fc; font-size:10px; color:#5a6275; text-transform:uppercase;">
+          <th align="left"  style="padding:8px 12px;">Port</th>
+          <th align="right" style="padding:8px 12px;">VLSFO</th>
+          <th align="right" style="padding:8px 12px;">Spread</th>
+          <th align="left"  style="padding:8px 12px;">Trade Relevance</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+    """
+
+
+def build_calendar_section(data: dict) -> str:
+    """Today's economic releases relevant to dry bulk freight."""
+    items = data.get("calendar") or []
+    if not items:
+        return f"""
+        {_section_header_chip("Economic Releases Today", "📅")}
+        <p style="font-size:12px; color:#5a6275; margin:0;">
+          No major commodity-relevant data releases scheduled today.
+        </p>
+        """
+
+    rows = []
+    for it in items:
+        imp_col = ("#c92a2a" if it["importance"] == "high" else
+                   "#d29922" if it["importance"] == "medium" else "#5a6275")
+        rows.append(f"""
+        <tr>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-size:11px; font-weight:600;">{it["time"]}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5;">
+            <a href="{it["url"]}" style="color:#0066cc; text-decoration:none; font-size:13px; font-weight:500;">{it["name"]}</a>
+          </td>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-size:11px; color:{imp_col}; font-weight:600; text-transform:uppercase;">{it["importance"]}</td>
+          <td style="padding:8px 12px; border-bottom:1px solid #f0f2f5; font-size:11px; color:#5a6275;">{it["note"]}</td>
+        </tr>
+        """)
+
+    return f"""
+    {_section_header_chip("Economic Releases Today · Freight Sensitivity", "📅")}
+    <p style="font-size:11px; color:#5a6275; margin:0 0 10px 0;">
+      Data releases that historically move dry bulk freight (directly or via commodity underlyings).
+      Times in CET — adjust for the actual time zone of the release. Click each release for the official source.
+    </p>
+    <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0; border-radius:6px;">
+      <thead>
+        <tr style="background:#f7f9fc; font-size:10px; color:#5a6275; text-transform:uppercase;">
+          <th align="left"  style="padding:8px 12px;">Time</th>
+          <th align="left"  style="padding:8px 12px;">Release</th>
+          <th align="left"  style="padding:8px 12px;">Impact</th>
+          <th align="left"  style="padding:8px 12px;">Why it matters</th>
+        </tr>
+      </thead>
+      <tbody>{''.join(rows)}</tbody>
+    </table>
+    """
 
 
 def build_hero_tiles(data: dict) -> str:
@@ -608,6 +1142,16 @@ def build_overnight_context(data: dict) -> str:
             f"{cycle_phrase}{pct_phrase}."
         )
 
+        # YoY context using BDRY proxy until enough real BDI history accumulates
+        yoy_proxy = data.get("yoy_bdi_proxy")
+        if yoy_proxy:
+            yoy_chg = (bdi_val / yoy_proxy - 1) * 100
+            direction = "above" if yoy_chg > 5 else ("below" if yoy_chg < -5 else "broadly in line with")
+            sentences.append(
+                f"This sits <b>{abs(yoy_chg):.0f}% {direction}</b> the BDRY-implied BDI from the same week one year ago "
+                f"(synthetic estimate: ~{int(yoy_proxy):,}) — useful seasonal context until the real BDI history file accumulates 12+ months."
+            )
+
         # Add BDRY paper line as a separate sentence so it doesn't crowd the lead
         if spot:
             bdry_dir = ("firmed" if bdry_d1d > 0.005 else
@@ -705,6 +1249,22 @@ def build_overnight_context(data: dict) -> str:
     {_section_header("Overnight Dry Bulk Context", "🌅")}
     <div style="font-size:14px; line-height:1.7; color:#1a202c; padding:16px 20px; background:#f7f9fc; border-left:4px solid #5b8cbf; border-radius:0 4px 4px 0;">
       {paragraph}
+    </div>
+    """
+
+
+def build_exec_summary_llm(data: dict) -> str | None:
+    """If ANTHROPIC_API_KEY is set, use Claude for the exec summary."""
+    narrative = generate_llm_narrative(data)
+    if not narrative:
+        return None
+    return f"""
+    {_section_header_chip("Executive Summary · AI-Generated", "🤖")}
+    <div style="font-size:14px; line-height:1.7; color:#1a202c; padding:16px 20px; background:#fafbfc; border-left:4px solid #5b8cbf; border-radius:0 4px 4px 0;">
+      {narrative}
+    </div>
+    <div style="margin-top:6px; font-size:10px; color:#9ba3b4; font-style:italic;">
+      Generated by Claude (Anthropic) from today's market facts. Always verify before acting.
     </div>
     """
 
@@ -1241,29 +1801,53 @@ def build_email(data: dict) -> tuple[str, str]:
         subject_parts.append(regime["label"])
     subject = " · ".join(subject_parts)
 
+    # Prefer LLM-generated exec summary when ANTHROPIC_API_KEY is set
+    exec_block = build_exec_summary_llm(data) or build_exec_summary(data)
+
     html = f"""<!DOCTYPE html>
 <html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<meta name="supported-color-schemes" content="light dark">
 <title>Dry Bulk Morning Briefing</title>
+<style>
+  /* Dark mode support — overrides inline light-mode styles */
+  @media (prefers-color-scheme: dark) {{
+    body, .email-bg {{ background: #0d1117 !important; }}
+    .email-card {{ background: #161b22 !important; color: #c9d1d9 !important; }}
+    .email-card-alt {{ background: #1c2128 !important; }}
+    .email-text {{ color: #c9d1d9 !important; }}
+    .email-text-sec {{ color: #8b949e !important; }}
+    .email-table-row {{ background: #161b22 !important; border-color: #30363d !important; }}
+    .email-table-head {{ background: #1c2128 !important; color: #8b949e !important; }}
+    a {{ color: #79c0ff !important; }}
+    hr {{ border-color: #30363d !important; }}
+  }}
+  /* Responsive: stack tile columns on mobile */
+  @media (max-width: 540px) {{
+    .tile-cell {{ display: block !important; width: 100% !important; padding: 4px 0 !important; }}
+    .email-container {{ padding: 12px 6px !important; }}
+  }}
+</style>
 </head>
-<body style="margin:0; padding:0; background:#eef2f7; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; color:#1a202c; line-height:1.5;">
-  <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background:#eef2f7; padding:24px 12px;">
+<body class="email-bg" style="margin:0; padding:0; background:#eef2f7; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif; color:#1a202c; line-height:1.5;">
+  <table cellpadding="0" cellspacing="0" border="0" width="100%" class="email-container" style="background:#eef2f7; padding:24px 12px;">
     <tr><td align="center">
-      <table cellpadding="0" cellspacing="0" border="0" width="720" style="max-width:720px; background:#ffffff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.06); overflow:hidden;">
+      <table cellpadding="0" cellspacing="0" border="0" width="720" class="email-card" style="max-width:720px; background:#ffffff; border-radius:8px; box-shadow:0 1px 3px rgba(0,0,0,0.06); overflow:hidden;">
 
-        <tr><td style="padding:28px 32px 18px; background:linear-gradient(180deg,#ffffff 0%,#fafbfc 100%); border-bottom:3px solid #1e3050;">
+        <tr><td style="padding:28px 32px 18px; background:linear-gradient(180deg,#ffffff 0%,#fafbfc 100%); border-bottom:3px solid #1e3050;" class="email-card">
           <table cellpadding="0" cellspacing="0" border="0" width="100%">
             <tr>
               <td valign="top">
                 <div style="font-size:11px; letter-spacing:0.14em; color:#5b8cbf; text-transform:uppercase; font-weight:700; font-family:'IBM Plex Mono',monospace;">
                   FreightIQ · Dry Bulk Morning Briefing
                 </div>
-                <div style="font-size:24px; color:#1a202c; font-weight:700; margin-top:8px; line-height:1.2;">
+                <div class="email-text" style="font-size:24px; color:#1a202c; font-weight:700; margin-top:8px; line-height:1.2;">
                   {date_str}
                 </div>
-                <div style="font-size:13px; color:#5a6275; margin-top:6px;">
+                <div class="email-text-sec" style="font-size:13px; color:#5a6275; margin-top:6px;">
                   Geneva · 07:30 CET · ~10 min read
                 </div>
               </td>
@@ -1271,20 +1855,24 @@ def build_email(data: dict) -> tuple[str, str]:
           </table>
         </td></tr>
 
-        <tr><td style="padding:20px 32px 8px;">{build_hero_tiles(data)}</td></tr>
-        <tr><td style="padding:16px 32px;">{build_overnight_context(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px; background:#fafbfc;">{build_exec_summary(data)}</td></tr>
-        <tr><td style="padding:24px 32px; background:#ffffff;">{build_real_bdi_section(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px; background:#ffffff;">{build_levels_table(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px;">{build_ffa_curve(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px;">{build_supply_section(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px;">{build_demand_section(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px;">{build_geo_signals(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px;">{build_news_section(data)}</td></tr>
-        <tr><td style="padding:0 32px 24px;">{build_watch_section(data)}</td></tr>
-        <tr><td style="padding:18px 32px 24px; border-top:1px solid #e2e8f0; background:#fafbfc;">{build_sources()}</td></tr>
+        <tr><td style="padding:20px 32px 8px;" class="email-card">{build_hero_tiles(data)}</td></tr>
+        <tr><td style="padding:16px 32px;" class="email-card">{build_overnight_context(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px; background:#fafbfc;" class="email-card-alt">{exec_block}</td></tr>
+        <tr><td style="padding:24px 32px; background:#ffffff;" class="email-card">{build_real_bdi_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px; background:#ffffff;" class="email-card">{build_subsegment_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_levels_table(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_ffa_curve(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_supply_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_ag_ports_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_bunker_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_demand_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_calendar_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_geo_signals(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_news_section(data)}</td></tr>
+        <tr><td style="padding:0 32px 24px;" class="email-card">{build_watch_section(data)}</td></tr>
+        <tr><td style="padding:18px 32px 24px; border-top:1px solid #e2e8f0; background:#fafbfc;" class="email-card-alt">{build_sources()}</td></tr>
 
-        <tr><td style="padding:18px 32px 28px; border-top:1px solid #e2e8f0; font-size:10px; color:#9ba3b4; line-height:1.5;">
+        <tr><td style="padding:18px 32px 28px; border-top:1px solid #e2e8f0; font-size:10px; color:#9ba3b4; line-height:1.5;" class="email-text-sec">
           Generated by FreightIQ · automated daily delivery via GitHub Actions cron.
           This briefing is for informational purposes only and does not constitute investment advice.
           Freight indices shown are public-API proxies; institutional Baltic Exchange data requires subscription.
