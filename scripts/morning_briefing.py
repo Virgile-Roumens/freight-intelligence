@@ -20,6 +20,7 @@ import warnings
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from html import escape
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -98,6 +99,104 @@ def scrape_bdi() -> dict | None:
         return {"value": val, "source": "tradingeconomics.com", "url": url}
     except Exception as e:
         log.warning(f"BDI scrape failed: {e}")
+        return None
+
+
+_BRAEMAR_GRAPHQL_URL = "https://api.braemarscreen.com/api/graphql"
+_BRAEMAR_MARKETS_QUERY = """query homepageMarkets {
+  brokerSite {
+    ticker {
+      name
+      products { id name price prevClose }
+    }
+  }
+}"""
+_BRAEMAR_NEWS_QUERY = """query newsFeed {
+  newsFeed {
+    source { name url }
+    timestamp
+    title
+    url
+  }
+}"""
+
+
+def scrape_braemar_screen() -> dict | None:
+    """Fetch public, 30-minute-delayed Braemar homepage Cape marks and news."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (compatible; FreightIQ/1.0)",
+        "Origin": "https://www.braemarscreen.com",
+        "Referer": "https://www.braemarscreen.com/",
+    })
+
+    def query(operation: str, query_text: str) -> dict:
+        response = session.post(
+            _BRAEMAR_GRAPHQL_URL,
+            json={"operationName": operation, "variables": {}, "query": query_text},
+            timeout=12,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        if payload.get("errors"):
+            raise ValueError(f"Braemar {operation} returned GraphQL errors")
+        return payload.get("data") or {}
+
+    try:
+        market_data = query("homepageMarkets", _BRAEMAR_MARKETS_QUERY)
+        news_data = query("newsFeed", _BRAEMAR_NEWS_QUERY)
+        ticker_groups = (market_data.get("brokerSite") or {}).get("ticker") or []
+        cape_group = next(
+            (group for group in ticker_groups
+             if "cape" in str(group.get("name", "")).casefold()),
+            None,
+        )
+        if not cape_group:
+            log.warning("Braemar scrape: Cape market group not found")
+            return None
+
+        cape_products = []
+        for product in cape_group.get("products") or []:
+            try:
+                price = float(product["price"])
+                prev_close = float(product["prevClose"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if price <= 0 or prev_close <= 0:
+                continue
+            cape_products.append({
+                "name": str(product.get("name", "")),
+                "price": price,
+                "prev_close": prev_close,
+                "change": price - prev_close,
+                "change_pct": (price / prev_close - 1) * 100,
+            })
+
+        if not cape_products:
+            log.warning("Braemar scrape: no valid Cape market products")
+            return None
+
+        news = []
+        for item in news_data.get("newsFeed") or []:
+            source = item.get("source") or {}
+            news.append({
+                "title": item.get("title", ""),
+                "link": item.get("url", "#"),
+                "source": source.get("name", "Braemar Screen"),
+                "published": item.get("timestamp", ""),
+                "score": 0.0,
+            })
+
+        return {
+            "source": "Braemar Screen",
+            "url": "https://www.braemarscreen.com/",
+            "delay_minutes": 30,
+            "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "cape": cape_products,
+            "news": news,
+        }
+    except Exception as e:
+        log.warning(f"Braemar Screen scrape failed: {e}")
         return None
 
 
@@ -402,6 +501,63 @@ def _safe(fn, default, *args, **kwargs):
         return default
 
 
+def _parse_news_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            from email.utils import parsedate_to_datetime
+            parsed = parsedate_to_datetime(str(value))
+        except (TypeError, ValueError, OverflowError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _cape_news_score(article: dict) -> int:
+    text = f"{article.get('title', '')} {article.get('summary', '')}".casefold()
+    priority_terms = (
+        "capesize", "cape ffa", "5tc", "bci", "iron ore", "pilbara",
+        "tubarao", "vloc", "china steel", "vale", "ore exports",
+    )
+    secondary_terms = (
+        "dry bulk", "bulk carrier", "freight", "charter", "coal",
+        "china", "australia", "brazil", "ton-mile", "fleet", "red sea",
+        "suez", "port congestion", "sanction", "trade disruption",
+    )
+    return sum(4 for term in priority_terms if term in text) + sum(
+        1 for term in secondary_terms if term in text
+    )
+
+
+def _recent_cape_news(data: dict, hours: int = 24) -> list[dict]:
+    cutoff = datetime.now(timezone.utc) - pd.Timedelta(hours=hours)
+    braemar = data.get("braemar") or {}
+    candidates = list(data.get("articles") or []) + list(braemar.get("news") or [])
+    selected = {}
+    for article in candidates:
+        title = (article.get("title") or "").strip()
+        published = _parse_news_timestamp(article.get("published"))
+        if not title or published is None or published < cutoff:
+            continue
+        score = _cape_news_score(article)
+        if score == 0:
+            continue
+        key = title.casefold()
+        if key not in selected:
+            selected[key] = {**article, "cape_score": score, "parsed_published": published}
+        elif score > selected[key]["cape_score"]:
+            selected[key].update(cape_score=score)
+    return sorted(
+        selected.values(),
+        key=lambda article: (article["cape_score"], article["parsed_published"]),
+        reverse=True,
+    )
+
+
 def _fetch_macro() -> dict:
     """Cross-asset macro snapshot via yfinance."""
     out = {}
@@ -499,7 +655,16 @@ def fetch_all() -> dict:
     composite   = _safe(_fdm.get_weighted_shipping_index, pd.Series(dtype=float), period="3mo")
     bdry_spot, bdry_fwd = _fetch_bdry_forward()
     macro       = _fetch_macro()
+    braemar     = scrape_braemar_screen()
     articles    = _safe(_nd.fetch_all_feeds, [], max_per_feed=10)
+    braemar_news = (braemar or {}).get("news") or []
+    if braemar_news:
+        seen = {a.get("link") or a.get("title") for a in articles or []}
+        for item in braemar_news:
+            key = item.get("link") or item.get("title")
+            if key and key not in seen:
+                articles.append(item)
+                seen.add(key)
     signals     = _safe(_nd.detect_signals, [], articles) if articles else []
     ais_df      = _fetch_ais()
     regime      = _rd.detect_phase(composite) if not composite.empty else {}
@@ -546,6 +711,7 @@ def fetch_all() -> dict:
         "bdry_spot":     bdry_spot,
         "bdry_fwd":      bdry_fwd,
         "macro":         macro,
+        "braemar":       braemar,
         "articles":      articles or [],
         "signals":       signals or [],
         "ais":           ais_df,
@@ -603,6 +769,50 @@ def _section_header_chip(label: str, emoji: str = "", chip: str = "") -> str:
         f'text-transform:uppercase; font-weight:600; margin-bottom:10px;">'
         f'{e}{label}{chip_html}</div>'
     )
+
+
+def build_cape_market_section(data: dict) -> str:
+        braemar = data.get("braemar") or {}
+        products = braemar.get("cape") or []
+        if not products:
+                return f"""
+                {_section_header("Capesize FFA Curve", "🚢")}
+                <p style="font-size:12px; color:#5a6275; margin:0;">
+                    Braemar public marks unavailable; no proxy substituted. Check the source screen for current Cape pricing.
+                </p>
+                """
+
+        rows = []
+        for product in products:
+                name = escape(str(product.get("name", "")))
+                price = product["price"]
+                change = product["change"]
+                change_pct = product["change_pct"]
+                rows.append(f"""
+                <tr>
+                    <td style="padding:9px 12px; border-bottom:1px solid #f0f2f5; font-weight:600;">{name}</td>
+                    <td align="right" style="padding:9px 12px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-weight:700;">${price:,.0f}/day</td>
+                    <td align="right" style="padding:9px 12px; border-bottom:1px solid #f0f2f5;">{_arrow(change_pct)}</td>
+                    <td align="right" style="padding:9px 12px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace;">{change:+,.0f}/day</td>
+                </tr>
+                """)
+
+        return f"""
+        {_section_header("Capesize FFA Curve · Braemar Screen", "🚢")}
+        <p style="font-size:11px; color:#5a6275; margin:0 0 10px 0;">
+            Public screen marks, USD/day. Braemar states prices are delayed 30 minutes; daily change is versus previous close.
+            <a href="{braemar.get('url', 'https://www.braemarscreen.com/')}" style="color:#5b8cbf;">Source</a>.
+        </p>
+        <table cellpadding="0" cellspacing="0" border="0" width="100%" style="border:1px solid #e2e8f0; border-radius:4px;">
+            <thead><tr style="background:#f7f9fc; font-size:10px; color:#5a6275; text-transform:uppercase;">
+                <th align="left" style="padding:8px 12px;">Tenor</th>
+                <th align="right" style="padding:8px 12px;">Mark</th>
+                <th align="right" style="padding:8px 12px;">1D</th>
+                <th align="right" style="padding:8px 12px;">Change ($/day)</th>
+            </tr></thead>
+            <tbody>{''.join(rows)}</tbody>
+        </table>
+        """
 
 
 def build_subsegment_section(data: dict) -> str:
@@ -979,12 +1189,33 @@ def build_hero_tiles(data: dict) -> str:
     tiles_row = f"""
     <table cellpadding="0" cellspacing="0" border="0" width="100%" style="margin-bottom:8px;">
       <tr>
-        {_mini("BDRY · 5TC FFA",  bdry_val_str,  bdry_d if spot else None,  "5TC Capes paper")}
+         {_mini("BDRY · ETF proxy",  bdry_val_str,  bdry_d if spot else None,  "mixed dry-bulk FFAs")}
         {_mini("Brent Crude",     brent_val_str, brent.get("d1d"),          "Bunker → VLSFO")}
-        {_mini("USD Index",       dxy_val_str,   dxy.get("d1d"),            "Commodity headwind")}
+         {_mini("VALE equity",     f"${(macro.get('VALE') or {}).get('value', 0):.2f}" if macro.get("VALE") else "N/A",
+             (macro.get("VALE") or {}).get("d1d"), "iron-ore demand proxy")}
       </tr>
     </table>
     """
+
+    cape_products = (data.get("braemar") or {}).get("cape") or []
+    if cape_products:
+        front = cape_products[0]
+        cape_hero = f"""
+        <table cellpadding="0" cellspacing="0" border="0" width="100%" style="background:linear-gradient(135deg,#1e3050 0%,#2d4a6e 100%); border-radius:8px; color:#ffffff; margin-bottom:14px;">
+          <tr><td style="padding:20px 24px;">
+            <div style="font-size:10px; letter-spacing:0.16em; color:#a8c5e6; text-transform:uppercase; font-weight:600; font-family:'IBM Plex Mono',monospace;">
+              CAPE FFA · BRAEMAR SCREEN · DELAYED 30 MIN
+            </div>
+            <div style="font-size:32px; font-weight:700; color:#ffffff; margin-top:7px; line-height:1.1; font-family:'IBM Plex Mono',monospace;">
+              {escape(str(front.get('name', 'Prompt')))} &nbsp; ${front['price']:,.0f}/day
+            </div>
+            <div style="font-size:12px; color:#d7e4f2; margin-top:7px;">
+              Previous close {front['change']:+,.0f}/day &nbsp;·&nbsp; {_arrow(front['change_pct'])}
+            </div>
+          </td></tr>
+        </table>
+        """
+        return cape_hero + tiles_row
 
     return bdi_tile + tiles_row
 
@@ -1083,8 +1314,8 @@ def build_real_bdi_section(data: dict) -> str:
 def build_overnight_context(data: dict) -> str:
     """
     Narrative prose paragraph describing the overnight dry bulk market state.
-    Adapts daily based on BDRY direction, cycle phase, cross-asset moves,
-    FFA forward curve shape, and top news driver. ~3-5 sentences.
+    Adapts daily based on Cape FFA direction, BDRY paper, cycle phase,
+    cross-asset moves, and top overnight drivers. ~3-5 sentences.
     """
     snap     = data["snapshot"]
     macro    = data["macro"]
@@ -1093,10 +1324,11 @@ def build_overnight_context(data: dict) -> str:
     articles = data["articles"]
     spot     = data["bdry_spot"]
     fwd      = data["bdry_fwd"]
+    braemar  = data.get("braemar") or {}
+    cape_products = braemar.get("cape") or []
 
     sentences: list[str] = []
 
-    # ── Lead: REAL BDI first (if available), then BDRY paper market ──────────
     bdi        = data.get("bdi") or {}
     bdi_chg    = data.get("bdi_change") or {}
     bdi_val    = bdi.get("value")
@@ -1116,21 +1348,26 @@ def build_overnight_context(data: dict) -> str:
         "NEUTRAL":     "",
     }.get(regime.get("phase", ""), "")
 
-    # Pick the dominant 1D move to colour the narrative — prefer real BDI
-    primary_d1d = bdi_d1d if bdi_d1d is not None else bdry_d1d * 100
-    if   primary_d1d >  1.5: action = "extended sharply higher overnight"
-    elif primary_d1d >  0.5: action = "edged higher overnight"
-    elif primary_d1d < -1.5: action = "sold off overnight"
-    elif primary_d1d < -0.5: action = "drifted lower overnight"
-    else:                    action = "traded sideways overnight"
+    cape_front = cape_products[0] if cape_products else None
+    if cape_front:
+        cape_name = str(cape_front.get("name", "Cape FFA"))
+        cape_price = float(cape_front.get("price", 0) or 0)
+        cape_change = float(cape_front.get("change", 0) or 0)
+        cape_change_pct = float(cape_front.get("change_pct", 0) or 0)
+        direction = "firmed" if cape_change_pct >= 0 else "softened"
+        sentences.append(
+            f"<b>Capesize FFA</b> {cape_name} {direction} to <b>${cape_price:,.0f}/day</b> "
+            f"({cape_change:+,.0f}/day, {cape_change_pct:+.2f}%) — the key market signal in overnight paper."
+        )
 
+    # Keep the BDI/BDRY context as a supporting frame rather than the lead narrative
+    primary_d1d = bdi_d1d if bdi_d1d is not None else bdry_d1d * 100
     if bdi_val:
         five_day = ""
         if bdi_d5d is not None:
-            if   bdi_d5d >  5: five_day = f" (+{bdi_d5d:.1f}% over 5 sessions — momentum building)"
+            if   bdi_d5d >  5: five_day = f" (+{bdi_d5d:+.1f}% over 5 sessions — momentum building)"
             elif bdi_d5d < -5: five_day = f" ({bdi_d5d:+.1f}% over 5 sessions — sustained pressure)"
             elif abs(bdi_d5d) >= 2: five_day = f" ({bdi_d5d:+.1f}% on the week)"
-
         pct_phrase = ""
         if pctile is not None:
             if   pctile >= 80: pct_phrase = f" — currently in the {pctile:.0f}th percentile of recorded history (rich)"
@@ -1138,54 +1375,29 @@ def build_overnight_context(data: dict) -> str:
 
         d1d_str = f" ({bdi_d1d:+.2f}% 1D)" if bdi_d1d is not None else ""
         sentences.append(
-            f"<b>Baltic Dry Index</b> {action} at <b>{int(bdi_val):,}</b>{d1d_str}{five_day}"
-            f"{cycle_phrase}{pct_phrase}."
+            f"<b>BDI</b> {('extended sharply higher' if primary_d1d > 1.5 else 'edged higher' if primary_d1d > 0.5 else 'sold off' if primary_d1d < -1.5 else 'drifted lower' if primary_d1d < -0.5 else 'traded sideways')} overnight at <b>{int(bdi_val):,}</b>{d1d_str}{five_day}{cycle_phrase}{pct_phrase}."
         )
 
-        # YoY context using BDRY proxy until enough real BDI history accumulates
         yoy_proxy = data.get("yoy_bdi_proxy")
         if yoy_proxy:
             yoy_chg = (bdi_val / yoy_proxy - 1) * 100
             direction = "above" if yoy_chg > 5 else ("below" if yoy_chg < -5 else "broadly in line with")
             sentences.append(
-                f"This sits <b>{abs(yoy_chg):.0f}% {direction}</b> the BDRY-implied BDI from the same week one year ago "
-                f"(synthetic estimate: ~{int(yoy_proxy):,}) — useful seasonal context until the real BDI history file accumulates 12+ months."
+                f"This sits <b>{abs(yoy_chg):.0f}% {direction}</b> the year-ago synthetic BDI proxy, reinforcing the market's current strong seasonal backdrop."
             )
 
-        # Add BDRY paper line as a separate sentence so it doesn't crowd the lead
-        if spot:
-            bdry_dir = ("firmed" if bdry_d1d > 0.005 else
-                        "softened" if bdry_d1d < -0.005 else "held steady")
-            sentences.append(
-                f"BDRY ETF — the 5TC Capes / 4TC Panamax FFA-backed product, "
-                f"a forward-looking proxy — {bdry_dir} to <b>${spot:.2f}</b> "
-                f"({bdry_d1d*100:+.2f}%), implying a Day-+30 paper BDI around "
-                f"<b>{int(spot * _BDI_FACTOR_MID):,}</b>."
-            )
-    elif spot:
+    if spot:
+        bdry_dir = ("firmed" if bdry_d1d > 0.005 else "softened" if bdry_d1d < -0.005 else "held steady")
         sentences.append(
-            f"Dry bulk paper {action} — BDRY ETF (closest free 5TC Capes FFA proxy) "
-            f"settled at <b>${spot:.2f}</b>, implying a BDI level around "
-            f"<b>{int(spot * _BDI_FACTOR_MID):,}</b>{cycle_phrase}."
+            f"BDRY paper — the closest free 5TC Capes/4TC Panamax proxy — {bdry_dir} to <b>${spot:.2f}</b> ({bdry_d1d*100:+.2f}%), implying a Day-+30 paper BDI around <b>{int(spot * _BDI_FACTOR_MID):,}</b>."
         )
 
-    # ── Cross-asset context (only mention what actually moved) ───────────────
     cross_bits = []
-
     brent = macro.get("Brent")
     if brent and abs(brent["d1d"]) > 0.3:
         direction = "firmer" if brent["d1d"] > 0 else "softer"
         cross_bits.append(
-            f"Brent {direction} at <b>${brent['value']:.2f}/bbl</b> ({brent['d1d']:+.2f}%, "
-            f"VLSFO bunker proxy ~${brent['value']*6.5:.0f}/mt)"
-        )
-
-    dxy = macro.get("DXY")
-    if dxy and abs(dxy["d1d"]) > 0.25:
-        direction  = "firming"  if dxy["d1d"] > 0 else "softening"
-        impact     = "headwind" if dxy["d1d"] > 0 else "tailwind"
-        cross_bits.append(
-            f"DXY {direction} ({dxy['d1d']:+.2f}%) — typically a {impact} for commodity flows"
+            f"Brent {direction} at <b>${brent['value']:.2f}/bbl</b> ({brent['d1d']:+.2f}%)"
         )
 
     vale = macro.get("VALE")
@@ -1195,37 +1407,23 @@ def build_overnight_context(data: dict) -> str:
             f"iron ore proxy (VALE) {direction} {vale['d1d']:+.2f}% — Capesize demand bellwether"
         )
 
-    grain_moves = []
-    for key, lbl in [("Corn", "corn"), ("Wheat", "wheat"), ("Soybean", "soybeans")]:
-        m = macro.get(key)
-        if m and abs(m["d1d"]) > 1.0:
-            grain_moves.append(f"{lbl} {m['d1d']:+.2f}%")
-    if grain_moves:
-        cross_bits.append(
-            f"on the ag side {', '.join(grain_moves)} — relevant to LDC's Panamax/Supramax exposure"
-        )
-
     if cross_bits:
-        sentences.append("Cross-asset: " + "; ".join(cross_bits) + ".")
+        sentences.append("Cross-asset support: " + "; ".join(cross_bits) + ".")
 
-    # ── FFA forward curve shape ──────────────────────────────────────────────
     if spot and fwd:
         nearest = fwd[0]
         chg = (nearest["fwd"] / spot - 1) * 100
         if abs(chg) > 2:
             if chg < 0:
                 shape = "contango (forward at discount)"
-                read  = "paper pricing softer prompt physical or seasonal weakness"
+                read = "paper pricing softer prompt physical or seasonal weakness"
             else:
                 shape = "backwardation (forward at premium)"
-                read  = "paper signalling tight prompt supply"
+                read = "paper signalling tight prompt supply"
             sentences.append(
-                f"FFA forward curve sits in <b>{shape}</b> "
-                f"({datetime.strptime(nearest['expiry'], '%Y-%m-%d').strftime('%b %Y')} "
-                f"${nearest['fwd']:.2f}, {chg:+.1f}% vs spot) — {read}."
+                f"The FFA curve remains in <b>{shape}</b> ({datetime.strptime(nearest['expiry'], '%Y-%m-%d').strftime('%b %Y')} ${nearest['fwd']:.2f}, {chg:+.1f}% vs spot) — {read}."
             )
 
-    # ── Top hook: signal or highest-relevance article ────────────────────────
     hook = ""
     if sigs:
         s_text = (sigs[0].get("text", "") or "").strip()
@@ -1236,7 +1434,7 @@ def build_overnight_context(data: dict) -> str:
         if top.get("score", 0) > 0.5:
             hook = (top.get("title", "") or "")[:160]
     if hook:
-        sentences.append(f"<b>Watch today:</b> {hook}.")
+        sentences.append(f"<b>Overnight driver:</b> {hook}.")
 
     if not sentences:
         sentences = [
@@ -1246,7 +1444,7 @@ def build_overnight_context(data: dict) -> str:
 
     paragraph = " ".join(sentences)
     return f"""
-    {_section_header("Overnight Dry Bulk Context", "🌅")}
+    {_section_header("Overnight Cape Market Review", "🌅")}
     <div style="font-size:14px; line-height:1.7; color:#1a202c; padding:16px 20px; background:#f7f9fc; border-left:4px solid #5b8cbf; border-radius:0 4px 4px 0;">
       {paragraph}
     </div>
@@ -1276,8 +1474,18 @@ def build_exec_summary(data: dict) -> str:
     sigs   = data["signals"]
     spot   = data["bdry_spot"]
     fwd    = data["bdry_fwd"]
+    braemar = data.get("braemar") or {}
+    cape_products = braemar.get("cape") or []
 
     bullets = []
+
+    if cape_products:
+        front = cape_products[0]
+        cape_name = str(front.get("name", "Cape FFA"))
+        bullets.append(
+            f"<b>Capesize FFA</b> {cape_name} at <b>${front['price']:,.0f}/day</b> "
+            f"({front['change']:+,.0f}/day, {front['change_pct']:+.2f}%) — leading paper signal for the day."
+        )
 
     if spot:
         bdi_imp = int(spot * _BDI_FACTOR_MID)
@@ -1295,8 +1503,7 @@ def build_exec_summary(data: dict) -> str:
         nearest = fwd[0]
         chg = (nearest["fwd"] / spot - 1) * 100 if spot else 0
         bullets.append(
-            f"<b>FFA forward (put-call parity)</b> "
-            f"{datetime.strptime(nearest['expiry'], '%Y-%m-%d').strftime('%b %Y')}: "
+            f"<b>Cape FFA curve</b> {datetime.strptime(nearest['expiry'], '%Y-%m-%d').strftime('%b %Y')}: "
             f"<b>${nearest['fwd']:.2f}</b> ({chg:+.1f}% vs spot) — "
             f"market pricing {'a premium' if chg > 1 else 'a discount' if chg < -1 else 'roughly flat'} forward."
         )
@@ -1316,7 +1523,7 @@ def build_exec_summary(data: dict) -> str:
 
     if sigs:
         s = sigs[0]
-        bullets.append(f"<b>Top signal:</b> {s.get('text','')[:160]}")
+        bullets.append(f"<b>Top driver:</b> {s.get('text','')[:160]}")
 
     if not bullets:
         bullets = ["Data unavailable — markets closed or feeds unreachable."]
@@ -1340,7 +1547,7 @@ def _row(name, source_link, last, d1, d5, note, highlight=False):
       <td align="right" style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-weight:600;">{last}</td>
       <td align="right" style="padding:8px 10px; border-bottom:1px solid #f0f2f5;">{_arrow(d1)}</td>
       <td align="right" style="padding:8px 10px; border-bottom:1px solid #f0f2f5;">{_arrow(d5)}</td>
-      <td style="padding:8px 10px; border-bottom:1px solid #f0f2f5; color:#5a6275; font-size:12px;">{note}</td>
+      <td style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-size:11px; color:#5a6275;">{note}</td>
     </tr>
     """
 
@@ -1436,7 +1643,7 @@ def build_ffa_curve(data: dict) -> str:
         <tr style="background:#f0f7ff;">
           <td style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-weight:700; color:#0066cc;">SPOT</td>
           <td align="right" style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; font-weight:700; color:#0066cc;">${spot:.2f}</td>
-          <td align="right" style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; color:#0066cc;">{int(spot*_BDI_FACTOR_MID):,}</td>
+          <td align="right" style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-family:'IBM Plex Mono',monospace; color:#d29922;">{int(spot*_BDI_FACTOR_MID):,}</td>
           <td style="padding:8px 10px; border-bottom:1px solid #f0f2f5; font-size:11px; color:#5a6275;">BDRY last close</td>
         </tr>
     """]
@@ -1673,9 +1880,9 @@ def build_news_section(data: dict) -> str:
         """)
 
     return f"""
-    {_section_header("Top Dry Bulk & Commodity Stories", "📰")}
+    {_section_header("Cape & Bulk Overnight Drivers", "📰")}
     <p style="font-size:12px; color:#5a6275; margin:0 0 10px 0;">
-      Curated from RSS feeds: TradeWinds, Splash247, Hellenic Shipping. Click headlines to verify source.
+      Curated from market feeds and Braemar Screen headlines. Focused on the overnight catalysts that matter most for Capesize/FFA sentiment.
     </p>
     <ul style="list-style:none; padding:0; margin:0;">
       {''.join(items)}
@@ -1749,6 +1956,7 @@ def build_watch_section(data: dict) -> str:
 
 def build_sources() -> str:
     sources = [
+        ("Braemar Screen",              "https://www.braemarscreen.com"),
         ("BDRY ETF & equities",         "https://finance.yahoo.com/quote/BDRY"),
         ("Brent / WTI / 10Y / DXY",     "https://finance.yahoo.com"),
         ("FRED macroeconomic data",     "https://fred.stlouisfed.org"),
@@ -1787,10 +1995,13 @@ def build_email(data: dict) -> tuple[str, str]:
     bdry_v = bdry.get("value")
     bdry_d = bdry.get("delta_1d")
 
-    # Subject: lead with REAL BDI if available, else BDRY
+    # Subject: lead with Cape FFA/Braemar signal and keep dry bulk context as support
     bdi_val = (data.get("bdi") or {}).get("value")
     bdi_d1d = (data.get("bdi_change") or {}).get("d1d")
-    subject_parts = [f"🚢 Dry Bulk · {today.strftime('%a %d %b')}"]
+    cape_front = ((data.get("braemar") or {}).get("cape") or [None])[0]
+    subject_parts = [f"🚢 Cape Market · {today.strftime('%a %d %b')}"]
+    if cape_front:
+        subject_parts.append(f"{cape_front.get('name', 'Cape FFA')} ${cape_front.get('price', 0):,.0f}/d")
     if bdi_val is not None:
         bdi_chg_str = f" ({bdi_d1d:+.2f}%)" if bdi_d1d is not None else ""
         subject_parts.append(f"BDI {int(bdi_val):,}{bdi_chg_str}")
@@ -1842,7 +2053,7 @@ def build_email(data: dict) -> tuple[str, str]:
             <tr>
               <td valign="top">
                 <div style="font-size:11px; letter-spacing:0.14em; color:#5b8cbf; text-transform:uppercase; font-weight:700; font-family:'IBM Plex Mono',monospace;">
-                  FreightIQ · Dry Bulk Morning Briefing
+                  FreightIQ · Cape Market Morning Briefing
                 </div>
                 <div class="email-text" style="font-size:24px; color:#1a202c; font-weight:700; margin-top:8px; line-height:1.2;">
                   {date_str}
